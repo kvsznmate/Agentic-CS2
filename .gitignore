@@ -1,0 +1,32 @@
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── Conda / venv ─────────────────────────────────────────────────────────
+# The environment is rebuilt from environment.yml — never commit it.
+env/
+venv/
+.venv/
+
+# ── Project data & models (never commit — see PROJECT_ISSUES #4/#5) ───────
+# Recorded sessions, datasets, and trained weights are large and local.
+data/
+datasets/
+recordings/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+models/
+checkpoints/
+
+# ── OS / editor ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

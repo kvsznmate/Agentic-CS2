@@ -97,10 +97,11 @@ Labels: `infra` `data` `gate` `perception` `navigation` `combat` `integration` `
 
 ### M0 — Capture pipeline (GO/NO-GO)
 
-#### #1 Repo, environment, dependency pinning
+#### #1 Repo, environment, dependency pinning  ✅ built (pending env-create verification)
 **Labels:** `infra` · **Depends on:** —
 Pin the stack (Python + capture libs + framework + numpy + OpenCV). Document setup. Note version drift can change model behaviour.
 **Acceptance:** fresh checkout + docs yields a working env; smoke test imports core modules.
+**Delivered:** `environment.yml` (conda; faithful TF 2.3 / Py 3.7 repro — DECISIONS D-009), `src/__init__.py`, `src/smoke_test.py` (import + version + GPU-visibility check), `.gitignore`, setup docs in `README.md`. Capture lib settled as mss + crop (D-010). **Still to verify on-machine:** run `conda env create -f environment.yml` then `python -m src.smoke_test` and confirm `RESULT: all core imports succeeded.` — the env build itself hasn't been executed here, only specified. GPU path is CPU-only on modern cards (see README GPU caveat).
 
 #### #2 [GATE] CS2 screen capture
 **Labels:** `gate` `data` `infra` · **Depends on:** #1

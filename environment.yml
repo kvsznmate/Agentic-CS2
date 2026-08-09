@@ -1,0 +1,59 @@
+# environment.yml — Agentic-CS2
+#
+# Faithful conda reproduction of the reference study's stack (see DECISIONS.md D-009).
+# Python 3.7 + TensorFlow 2.3 + numpy 1.18 + OpenCV 4.4 + mss, on Windows.
+#
+# WHY CONDA (not pyproject/uv): TensorFlow 2.3's only official GPU path is
+# CUDA 10.1 + cuDNN 7.6, which is delivered through conda, not pip. Python 3.7
+# is also below the floor for uv/Poetry. This stack is therefore conda-only.
+#
+# ── GPU CAVEAT — READ BEFORE EXPECTING GPU TRAINING ──────────────────────────
+# The CUDA 10.1 toolchain that TF 2.3 requires targets older NVIDIA GPUs only.
+# On current cards (RTX 30/40/50-series, compute capability 8.6+), CUDA 10.1
+# will NOT drive the hardware and training falls back to CPU. If you have a
+# modern GPU and need GPU training, that requires modernizing the stack
+# (modern TF or PyTorch on Python 3.11) — revisit D-009. To force the CPU-only
+# build regardless of hardware, comment out the two `cudatoolkit`/`cudnn` lines
+# and the `tensorflow-gpu` pin below, leaving plain `tensorflow`.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Setup:
+#   conda env create -f environment.yml
+#   conda activate agentic-cs2
+#   python -m src.smoke_test      # verifies the stack imports (see #1 acceptance)
+
+name: agentic-cs2
+
+channels:
+  - conda-forge
+  - anaconda
+  - defaults
+
+dependencies:
+  # ── Interpreter ──────────────────────────────────────────────────────────
+  - python=3.7.15
+
+  # ── Core numerics / vision (pinned to reference versions) ────────────────
+  - numpy=1.18.5
+  - scipy=1.4.1
+  - opencv=4.4.0            # provides cv2; reference used 4.4.0 py37 build
+
+  # ── Deep learning (reference: TensorFlow 2.3, MKL/eigen build) ───────────
+  - tensorflow=2.3.0
+  # GPU path — only effective on older GPUs (see GPU CAVEAT above).
+  # These pull the CUDA 10.1 / cuDNN 7.6 toolchain TF 2.3 is built against.
+  - cudatoolkit=10.1
+  - cudnn=7.6
+
+  # ── Windows input/output plumbing ────────────────────────────────────────
+  # pywin32 is kept ONLY for simulated key output (key_output) later.
+  # NOTE: the reference's win32 BitBlt *screen capture* is NOT used — capture
+  # is mss + crop per DECISIONS.md D-010. pymem (memory inference) is dropped.
+  - pywin32=302
+
+  # ── Pip-only deps (match reference e2e.yml pip section) ──────────────────
+  - pip=22.3.1
+  - pip:
+      - mss==7.0.1          # screen capture (full-screen grab + crop, D-010)
+      - pillow==9.3.0
+      - matplotlib==3.5.3   # debugging / frame inspection only

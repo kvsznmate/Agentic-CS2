@@ -10,6 +10,14 @@ The project's decision log. Each entry is a settled direction and the reasoning 
 
 The entries below were established while scoping the project. They are the current ground truth.
 
+### D-010 · Capture library is `mss` full-screen grab + crop (win32 BitBlt is dead)
+**Decision:** Screen capture uses `mss` to grab the full screen, then crops to the CS2 game region and resizes to the fixed model input. The reference study's `screen_input.py` win32 `BitBlt`/`GetWindowDC` path is not carried over.
+**Why:** This was already the ground truth in PROJECT_ISSUES #2 but had no decision entry, so it kept living only in issue text. CS2 is Source 2; the legacy D3D9-era `BitBlt` capture the reference relied on is dead/unreliable on it. `mss` is already a dependency in the reference's own `e2e.yml` (7.0.1), so it carries over cleanly. Recording it here so it isn't re-litigated.
+
+### D-009 · Python stack pinned as a faithful conda repro of the reference (TF 2.3 / Py 3.7)
+**Decision:** The environment reproduces the reference study's `e2e.yml` stack — Python 3.7, TensorFlow 2.3, numpy 1.18, OpenCV 4.4, mss 7.0.1 — via conda (`environment.yml`), not via `pyproject.toml`/uv. The pieces tied to the reference's dead memory-inference and win32-capture paths (`pymem`, and the `BitBlt` use of `pywin32`) are dropped from the core; `pywin32` is kept only for simulated key output later.
+**Why:** Chosen deliberately over a modern stack (see below) for exact parity with the reference methods. The originally-requested combination — TF 2.3 + Py 3.7 + pyproject/uv + a modern CUDA build — is not installable as a set: Py 3.7 is EOL and below uv/Poetry's floor; TF 2.3's only official GPU path is CUDA 10.1 + cuDNN 7.6, which installs via conda (not pip/uv) and does not target current NVIDIA cards (RTX 30/40/50). Conda is therefore mandatory for this stack, which is why the reference itself shipped a conda env. **GPU caveat:** the CUDA 10.1 GPU path works only on older GPUs; on current cards the env runs CPU-only until the stack is modernized. Reconsider (move to modern TF or PyTorch on Py 3.11) if the EOL interpreter or CPU-only training becomes a real blocker.
+
 ### D-008 · The agent maintains this log and the other living docs
 **Decision:** Updating `DECISIONS.md`, `DATA_FORMAT.md`, and `PROJECT_ISSUES.md` is part of doing the work, not a separate chore. New decisions are appended here as/before they are acted on.
 **Why:** The plan reversed direction several times during scoping (see below). Without a written record, each new session re-litigates settled questions and re-suggests rejected approaches. The log is the memory that prevents that.
