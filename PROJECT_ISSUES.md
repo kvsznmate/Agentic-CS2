@@ -101,7 +101,7 @@ Labels: `infra` `data` `gate` `perception` `navigation` `combat` `integration` `
 **Labels:** `infra` · **Depends on:** —
 Pin the stack (Python + capture libs + framework + numpy + OpenCV). Document setup. Note version drift can change model behaviour.
 **Acceptance:** fresh checkout + docs yields a working env; smoke test imports core modules.
-**Delivered:** `environment.yml` (conda; faithful TF 2.3 / Py 3.7 repro — DECISIONS D-009), `src/__init__.py`, `src/smoke_test.py` (import + version + GPU-visibility check), `.gitignore`, setup docs in `README.md`. Capture lib settled as mss + crop (D-010). **Still to verify on-machine:** run `conda env create -f environment.yml` then `python -m src.smoke_test` and confirm `RESULT: all core imports succeeded.` — the env build itself hasn't been executed here, only specified. GPU path is CPU-only on modern cards (see README GPU caveat).
+**Delivered:** `environment.yml` (conda; native-Windows **TF 2.10 + CUDA 11.2 + Py 3.10**, GPU on the RTX 4050 — DECISIONS D-011, superseding D-009), `src/__init__.py`, `src/smoke_test.py` (import + version + GPU-detection check), `.gitignore`, setup docs in `README.md`. Capture lib settled as mss + crop (D-010). **Still to verify on-machine:** run `conda env create -f environment.yml` then `python -m src.smoke_test` and confirm `RESULT: all core imports succeeded. GPU visible.` — the env build itself hasn't been executed here, only specified. GPU detection depends on a current NVIDIA driver + the CUDA/cuDNN conda packages installing cleanly (see README GPU setup).
 
 #### #2 [GATE] CS2 screen capture
 **Labels:** `gate` `data` `infra` · **Depends on:** #1

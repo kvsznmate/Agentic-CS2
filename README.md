@@ -20,10 +20,12 @@ milestone/issue plan.
 
 ## Environment setup (Issue #1)
 
-The Python stack is a **faithful conda reproduction** of the reference study's
-environment: **Python 3.7 · TensorFlow 2.3 · numpy 1.18 · OpenCV 4.4 · mss 7.0.1**,
-on Windows. This choice (and why it is conda, not `pyproject.toml`/uv) is
-recorded in `DECISIONS.md` **D-009**.
+The Python stack runs on **native Windows with GPU support on the RTX 4050**:
+**Python 3.10 · TensorFlow 2.10.1 · CUDA 11.2 · cuDNN 8.1 · numpy 1.26 · mss 7.0.1 ·
+OpenCV 4.10**. Why this exact stack (and not a newer TF, or WSL2) is recorded in
+`DECISIONS.md` **D-011** — short version: **TF 2.10 is the last TensorFlow with
+GPU support on native Windows**, and staying native keeps the model on the same
+OS as the CS2 capture/input layer.
 
 ```bash
 conda env create -f environment.yml
@@ -31,23 +33,34 @@ conda activate agentic-cs2
 python -m src.smoke_test
 ```
 
-`src/smoke_test.py` verifies every pinned dependency imports and reports the
-loaded versions against what's expected. A clean run printing
-`RESULT: all core imports succeeded.` satisfies Issue #1's acceptance
-("fresh checkout + docs yields a working env; smoke test imports core modules").
+`src/smoke_test.py` verifies every pinned dependency imports, reports loaded
+versions against what's expected, and reports whether the GPU is visible. A
+clean run printing `RESULT: all core imports succeeded. GPU visible.` satisfies
+Issue #1's acceptance ("fresh checkout + docs yields a working env; smoke test
+imports core modules").
 
-### ⚠ GPU caveat — read before expecting GPU training
+### GPU setup — the 4050 should be detected
 
-TensorFlow 2.3's only official GPU path is **CUDA 10.1 + cuDNN 7.6**, which the
-conda env installs. That toolchain targets **older NVIDIA GPUs only**. On
-current cards (**RTX 30/40/50-series**, compute capability 8.6+) CUDA 10.1 will
-not drive the hardware and **training falls back to CPU**. If you have a modern
-GPU and need GPU training, that requires modernizing the stack (modern
-TensorFlow, or PyTorch, on Python 3.11) — revisit **D-009** before doing so.
-`smoke_test.py` reports whether TensorFlow actually sees a GPU.
+Unlike a CPU-only stack, here the GPU is the point. `cudatoolkit=11.2` and
+`cudnn=8.1.0` come from conda-forge (pip cannot install CUDA libs on Windows);
+TensorFlow is pip-installed into the env. For the 4050 to be seen you also need:
 
-To force a CPU-only build regardless of hardware, follow the comment block at
-the top of `environment.yml`.
+- a **current NVIDIA Windows driver** (the driver — not the toolkit — is what
+  gives an Ada card support under the 11.2 runtime libraries; update via GeForce
+  Experience or nvidia.com), and
+- the **Microsoft Visual C++ 2015–2022 redistributable** (usually already
+  present on a gaming machine).
+
+If `smoke_test.py` prints `warn TensorFlow sees NO GPU`, that's a setup issue,
+not expected behaviour — check the driver first, then that the CUDA/cuDNN conda
+packages actually installed. `nvidia-smi` at a terminal confirms the driver sees
+the card.
+
+> **Note on native-Windows GPU + TensorFlow:** GPU support ends at TF 2.10; TF
+> 2.11+ needs WSL2 or is CPU-only. We deliberately stay on 2.10 to keep the
+> whole agent on one OS (see D-011). If the project ever outgrows 2.10, moving
+> to WSL2 + modern TF is the escape hatch — at the cost of bridging capture and
+> input across the Windows/Linux boundary.
 
 ---
 

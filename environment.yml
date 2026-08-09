@@ -1,59 +1,69 @@
 # environment.yml — Agentic-CS2
 #
-# Faithful conda reproduction of the reference study's stack (see DECISIONS.md D-009).
-# Python 3.7 + TensorFlow 2.3 + numpy 1.18 + OpenCV 4.4 + mss, on Windows.
+# Native-Windows stack with GPU support on the RTX 4050 (Ada, CC 8.9).
+# Python 3.10 + TensorFlow 2.10 + CUDA 11.2 + cuDNN 8.1 + mss + OpenCV.
+# Rationale and the full decision trail are in DECISIONS.md D-009 (superseded)
+# and D-011 (current).
 #
-# WHY CONDA (not pyproject/uv): TensorFlow 2.3's only official GPU path is
-# CUDA 10.1 + cuDNN 7.6, which is delivered through conda, not pip. Python 3.7
-# is also below the floor for uv/Poetry. This stack is therefore conda-only.
+# ── WHY THIS EXACT STACK ─────────────────────────────────────────────────────
+# TensorFlow 2.10 is the LAST TF release with GPU support on native Windows.
+# From TF 2.11 on, native-Windows GPU is gone — you'd need WSL2 or CPU-only.
+# We stay native Windows because the capture (#2) and input (#3) layers hook
+# the Windows desktop where CS2 runs; splitting the model into WSL2 would cut
+# the agent across two OSes right at the capture+sync gate (the #1 risk).
+# So: newest TF that (a) uses the 4050 and (b) keeps everything on Windows
+# = TF 2.10. Official pairing: cudatoolkit=11.2, cudnn=8.1.0, Python 3.9–3.11.
 #
-# ── GPU CAVEAT — READ BEFORE EXPECTING GPU TRAINING ──────────────────────────
-# The CUDA 10.1 toolchain that TF 2.3 requires targets older NVIDIA GPUs only.
-# On current cards (RTX 30/40/50-series, compute capability 8.6+), CUDA 10.1
-# will NOT drive the hardware and training falls back to CPU. If you have a
-# modern GPU and need GPU training, that requires modernizing the stack
-# (modern TF or PyTorch on Python 3.11) — revisit D-009. To force the CPU-only
-# build regardless of hardware, comment out the two `cudatoolkit`/`cudnn` lines
-# and the `tensorflow-gpu` pin below, leaving plain `tensorflow`.
+# ── WHY CONDA (not pip / pyproject / uv) ─────────────────────────────────────
+# On native Windows, pip will NOT install the CUDA libraries. cudatoolkit +
+# cudnn must come from conda-forge. TF itself is then pip-installed INTO the
+# conda env (TF is only officially released to PyPI). This mixed pattern is the
+# TF-recommended one for Windows GPU.
+#
+# ── GPU SANITY ───────────────────────────────────────────────────────────────
+# Requires a current NVIDIA Windows driver (the driver, not the toolkit, is what
+# gives an Ada 4050 support under the 11.2 runtime libs). Update via GeForce
+# Experience / NVIDIA if the smoke test reports 0 GPUs. Also needs the MSVC
+# 2015–2022 redistributable (usually already present on a gaming machine).
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Setup:
+# Setup (full step-by-step in README.md):
 #   conda env create -f environment.yml
 #   conda activate agentic-cs2
-#   python -m src.smoke_test      # verifies the stack imports (see #1 acceptance)
+#   python -m src.smoke_test          # verifies imports + reports GPU visibility
 
 name: agentic-cs2
 
 channels:
   - conda-forge
-  - anaconda
   - defaults
 
 dependencies:
   # ── Interpreter ──────────────────────────────────────────────────────────
-  - python=3.7.15
+  - python=3.10
 
-  # ── Core numerics / vision (pinned to reference versions) ────────────────
-  - numpy=1.18.5
-  - scipy=1.4.1
-  - opencv=4.4.0            # provides cv2; reference used 4.4.0 py37 build
+  # ── CUDA libraries (conda-forge — the ONLY reliable source on Windows) ────
+  # This exact pairing is what the TF install guide specifies for 2.10 GPU.
+  - cudatoolkit=11.2
+  - cudnn=8.1.0
 
-  # ── Deep learning (reference: TensorFlow 2.3, MKL/eigen build) ───────────
-  - tensorflow=2.3.0
-  # GPU path — only effective on older GPUs (see GPU CAVEAT above).
-  # These pull the CUDA 10.1 / cuDNN 7.6 toolchain TF 2.3 is built against.
-  - cudatoolkit=10.1
-  - cudnn=7.6
+  # ── Core numerics / vision ───────────────────────────────────────────────
+  # numpy kept <2 for TF 2.10 ABI compatibility (TF 2.10 predates the numpy-2 ABI).
+  - numpy=1.26.4
+  - scipy
+  - pip
 
   # ── Windows input/output plumbing ────────────────────────────────────────
-  # pywin32 is kept ONLY for simulated key output (key_output) later.
-  # NOTE: the reference's win32 BitBlt *screen capture* is NOT used — capture
-  # is mss + crop per DECISIONS.md D-010. pymem (memory inference) is dropped.
-  - pywin32=302
+  # pywin32 kept ONLY for simulated key output (key_output) later. The
+  # reference's win32 BitBlt *screen capture* is NOT used — capture is mss +
+  # crop (DECISIONS.md D-010). pymem (memory inference) is dropped.
+  - pywin32
 
-  # ── Pip-only deps (match reference e2e.yml pip section) ──────────────────
-  - pip=22.3.1
+  # ── Pip-installed (TF is only on PyPI; these ride along) ──────────────────
   - pip:
-      - mss==7.0.1          # screen capture (full-screen grab + crop, D-010)
-      - pillow==9.3.0
-      - matplotlib==3.5.3   # debugging / frame inspection only
+      # "<2.11" is the ceiling for native-Windows GPU. Pinned explicitly.
+      - tensorflow==2.10.1
+      - mss==7.0.1              # screen capture (full-screen grab + crop, D-010)
+      - opencv-python==4.10.0.84  # cv2
+      - pillow==9.5.0
+      - matplotlib==3.7.5      # debugging / frame inspection only
