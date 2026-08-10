@@ -33,7 +33,11 @@ Entry points:
 """
 
 import argparse
+import json
 import os
+import queue
+import shutil
+import threading
 import time
 
 import numpy as np
@@ -54,6 +58,18 @@ _REC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "rec
 # working loop. dxcam is the documented lever (D-014) if the full agent loop
 # (with model inference) later needs more headroom.
 LOOP_FPS = 15
+
+# ── Chunked-session parameters (Issue #4 / D-018) ──────────────────────────
+# A long session is written as a folder of chunk files so memory stays bounded
+# and a crash loses at most one in-progress chunk. At 15 FPS a 150x270x3 frame
+# is ~121 KB uncompressed, ~1.8 MB/s, so 1800 frames (~2 min) is a few hundred MB
+# in RAM per chunk before flush — comfortable, and a good crash-loss granularity.
+CHUNK_FRAMES = 1800  # flush a chunk every this many frames (~2 min at 15 FPS)
+
+# Refuse to start / keep recording if free disk space falls below this, so a long
+# unattended session can't fill the drive. ~6.6 GB/hour uncompressed is the
+# budget (DATA_FORMAT.md); compressed is less but we stay conservative.
+MIN_FREE_DISK_GB = 5.0
 
 # ── Keys we log ───────────────────────────────────────────────────────────
 # Movement + jump/crouch + reload + weapon slots, mirroring the study's action
@@ -242,6 +258,201 @@ def profile(seconds=20.0):
     return fps
 
 
+def _geom_string():
+    """Human-readable capture-geometry stamp for self-describing files (D-017)."""
+    gw, gh = cfg.GAME_RES
+    ih, iw = cfg.MODEL_INPUT_HW
+    return (f"fullscreen {gw}x{gh} -> crop "
+            f"L{cfg.CROP_LEFT}T{cfg.CROP_TOP}W{cfg.CROP_WIDTH}H{cfg.CROP_HEIGHT} "
+            f"-> {iw}x{ih} {cfg.COLOR_FORMAT}")
+
+
+def _free_disk_gb(path):
+    """Free space (GB) on the filesystem holding `path`."""
+    usage = shutil.disk_usage(path)
+    return usage.free / (1024 ** 3)
+
+
+class ChunkedSessionWriter:
+    """Writes a session as a folder of chunk .npz files with a manifest.
+
+    Chunks are written on a BACKGROUND THREAD (D-019) so the capture loop never
+    pauses to save. `flush()` snapshots the current buffer and hands it to a
+    queue; a single writer thread compresses and writes it (atomic .tmp.npz ->
+    rename) while the capture loop keeps grabbing the next chunk. This fixes the
+    ~10 s capture stall the earlier synchronous flush caused at every chunk
+    boundary (D-018).
+
+    Sync-safety (important, re D-015): the writer thread touches ONLY finished,
+    handed-off buffers. It never touches the capture, the timestamps, or the
+    mouse listener. The frame/input alignment path stays fully synchronous and
+    single-threaded; only the disk write is moved off it. So the "way one"
+    synchronous-capture decision is preserved — threading is confined to I/O.
+
+    Backpressure (Option A, single-chunk depth): the handoff queue has capacity
+    1. If the writer is still busy when the next chunk is ready, `flush()` blocks
+    until the writer drains — bounding memory to ~2 chunks. With a ~10 s write
+    against a ~120 s fill window this effectively never triggers, but if the disk
+    ever stalls that long we'd rather pause than grow memory without bound.
+
+    Usage:
+        w = ChunkedSessionWriter(session_dir)
+        for each tick: w.add(frame, record)   # buffers; auto-flushes each chunk
+        w.close()                              # drains queue, marks complete
+    """
+
+    def __init__(self, session_dir, chunk_frames=CHUNK_FRAMES):
+        self.dir = session_dir
+        self.chunk_frames = chunk_frames
+        os.makedirs(self.dir, exist_ok=True)
+        self.session_name = os.path.basename(self.dir.rstrip(os.sep))
+        self._buf = self._empty_buffer()
+        self._geom = _geom_string()
+
+        # State OWNED BY THE WRITER THREAD once started (main thread reads copies
+        # for progress only). Chunk list + counts are mutated only in the worker.
+        self._chunk_files = []
+        self._total_frames = 0
+        self._chunk_index = 0            # next index to assign (main thread, at flush)
+        self._write_error = None         # first exception seen by the worker
+
+        # capacity-1 queue = Option A single-chunk backpressure
+        self._q = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(target=self._writer_loop, name="chunk-writer",
+                                        daemon=True)
+        self._thread.start()
+        self._write_manifest(complete=False)
+
+    @staticmethod
+    def _empty_buffer():
+        return {"t": [], "keys": [], "lclick": [], "rclick": [], "dx": [], "dy": [],
+                "frames": []}
+
+    def add(self, frame, record):
+        """Buffer one tick; hand off a chunk when the buffer reaches chunk_frames."""
+        b = self._buf
+        b["frames"].append(frame)
+        b["t"].append(record["t"])
+        b["keys"].append(record["keys"])
+        b["lclick"].append(record["lclick"])
+        b["rclick"].append(record["rclick"])
+        b["dx"].append(record["dx"])
+        b["dy"].append(record["dy"])
+        if len(b["frames"]) >= self.chunk_frames:
+            self.flush()
+
+    def flush(self):
+        """Hand the current buffer to the writer thread (non-blocking in practice).
+
+        Assigns this chunk's index and filename, enqueues the buffer, and
+        immediately starts a fresh buffer so the capture loop keeps running while
+        the worker writes. Blocks ONLY if the previous chunk is still being
+        written (capacity-1 queue) — the Option A backpressure.
+        """
+        b = self._buf
+        if len(b["frames"]) == 0:
+            return
+        # Surface any writer error promptly rather than silently losing chunks.
+        if self._write_error is not None:
+            raise self._write_error
+        idx = self._chunk_index
+        fname = f"chunk_{idx:05d}.npz"
+        self._chunk_index += 1
+        self._buf = self._empty_buffer()  # main thread moves on immediately
+        # Hand off (idx, fname, buffer). put() blocks if worker still busy.
+        self._q.put((idx, fname, b))
+
+    def _writer_loop(self):
+        """Background thread: drain the queue, write each chunk, update manifest."""
+        while True:
+            item = self._q.get()
+            if item is None:          # sentinel = shut down
+                self._q.task_done()
+                return
+            idx, fname, b = item
+            try:
+                self._write_chunk(idx, fname, b)
+                self._chunk_files.append(fname)
+                self._total_frames += len(b["frames"])
+                self._write_manifest(complete=False)
+            except Exception as e:  # noqa: BLE001 - record, keep thread alive
+                if self._write_error is None:
+                    self._write_error = e
+                print(f"\n  WARNING: chunk {fname} write failed ({e!r}).")
+            finally:
+                self._q.task_done()
+
+    def _write_chunk(self, idx, fname, b):
+        """Compress + atomically write one chunk. Runs on the writer thread."""
+        final = os.path.join(self.dir, fname)
+        # Temp name ends in .npz on purpose: np.savez_compressed APPENDS ".npz"
+        # to any path not already ending in it, so a ".tmp" target would become
+        # ".tmp.npz" and the os.replace would fail. .npz-suffixed temp avoids that.
+        tmp = os.path.join(self.dir, f"chunk_{idx:05d}.tmp.npz")
+        arrays = {
+            "schema_version": np.array(2),
+            "geom": np.array(self._geom),
+            "loop_fps_target": np.array(LOOP_FPS),
+            "frames": np.asarray(b["frames"], dtype=np.uint8),
+            "timestamps": np.asarray(b["t"], dtype=np.float64),
+            "keys": np.asarray(b["keys"], dtype=np.uint8),
+            "key_names": np.array([k for k, _ in LOGGED_KEYS]),
+            "lclick": np.asarray(b["lclick"], dtype=np.uint8),
+            "rclick": np.asarray(b["rclick"], dtype=np.uint8),
+            "dx": np.asarray(b["dx"], dtype=np.int32),
+            "dy": np.asarray(b["dy"], dtype=np.int32),
+        }
+        np.savez_compressed(tmp, **arrays)
+        os.replace(tmp, final)
+
+    def _write_manifest(self, complete):
+        manifest = {
+            "schema_version": 2,
+            "session": self.session_name,
+            "geom": self._geom,
+            "loop_fps_target": LOOP_FPS,
+            "chunks": list(self._chunk_files),
+            "total_frames": self._total_frames,
+            "complete": complete,
+        }
+        mpath = os.path.join(self.dir, "manifest.json")
+        tmp = mpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp, mpath)
+
+    @property
+    def chunks_written(self):
+        """How many chunks have actually landed on disk (for progress display)."""
+        return len(self._chunk_files)
+
+    def close(self):
+        """Hand off the remainder, wait for the writer to finish, mark complete.
+
+        Runs from record_session's `finally`, so it must not raise even if a
+        write failed — otherwise it would mask the original error. Any buffered
+        remainder is enqueued, the writer is told to stop, and we join it so all
+        chunks are on disk before we mark the session complete. If any chunk
+        write errored, the session is marked INCOMPLETE (loadable up to the last
+        good chunk) rather than falsely complete.
+        """
+        try:
+            self.flush()  # enqueue remainder (no-op if buffer empty)
+        except Exception as e:  # noqa: BLE001 - finalizer must not propagate
+            if self._write_error is None:
+                self._write_error = e
+        # Signal shutdown and wait for the writer to drain the queue.
+        self._q.put(None)
+        self._thread.join()
+        ok = self._write_error is None
+        self._write_manifest(complete=ok)
+        if not ok:
+            print(f"\n  WARNING: one or more chunk writes failed ({self._write_error!r}). "
+                  f"Session marked incomplete; {self._total_frames} frames in "
+                  f"{len(self._chunk_files)} chunk(s) are readable.")
+        return self._total_frames
+
+
 def record(seconds=60.0, name=None):
     """Record a session to disk as an .npz: frames + aligned action arrays.
 
@@ -338,6 +549,94 @@ def record(seconds=60.0, name=None):
         assert d["dx"].shape[0] == len(frames)
     print("  Round-trip OK: reloaded and shapes match.")
     return path
+
+
+def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
+    """Extended chunked recording (Issue #4) — the real long-session recorder.
+
+    Writes a v2 session folder (DATA_FORMAT.md): chunks flushed every
+    `chunk_frames` frames so memory stays bounded and a crash loses at most one
+    in-progress chunk. Runs until F8, until `seconds` elapses (if given), or
+    until interrupted — and in every one of those cases the buffered frames are
+    flushed and the manifest marked complete, so you never lose a clean session.
+
+    Disk safety: refuses to start below MIN_FREE_DISK_GB, and stops cleanly if
+    free space crosses that floor mid-session, so an unattended run can't fill
+    the drive.
+
+    This is what #4 means by "usable for extended sessions without babysitting."
+    """
+    os.makedirs(_REC_DIR, exist_ok=True)
+    if name is None:
+        name = time.strftime("session_%Y%m%d_%H%M%S")
+    session_dir = os.path.join(_REC_DIR, name)
+
+    free = _free_disk_gb(_REC_DIR)
+    if free < MIN_FREE_DISK_GB:
+        print(f"REFUSING TO START: only {free:.1f} GB free, need "
+              f"{MIN_FREE_DISK_GB:.1f} GB. Free up disk space first.")
+        return None
+
+    dur = f"{seconds:.0f}s" if seconds else "until F8"
+    print(f"Recording session '{name}' ({dur}). Press F8 to stop.")
+    print(f"  chunks every {chunk_frames} frames (~{chunk_frames/LOOP_FPS:.0f}s), "
+          f"{free:.1f} GB free, floor {MIN_FREE_DISK_GB:.0f} GB.")
+    print("  Play normally. Keep CS2 focused and in-game.\n")
+
+    writer = ChunkedSessionWriter(session_dir, chunk_frames=chunk_frames)
+    n = 0
+    dropped = 0
+    stop_reason = "F8"
+    t_start = time.perf_counter()
+    last_t = None
+    last_disk_check = t_start
+    try:
+        with Recorder() as rec:
+            while True:
+                loop_start = time.perf_counter()
+                if _key_down(VK_QUIT):
+                    stop_reason = "F8"
+                    break
+                frame, r = rec.read_frame_record()
+                writer.add(frame, r)
+                if last_t is not None and (r["t"] - last_t) > 1.8 / LOOP_FPS:
+                    dropped += 1
+                last_t = r["t"]
+                n += 1
+                if n % 20 == 0:
+                    elapsed = time.perf_counter() - t_start
+                    print(f"  {n} frames, {writer.chunks_written} chunks written, "
+                          f"{n/elapsed:.1f} FPS, {dropped} long-gaps", end="\r")
+                # periodic disk check (every ~10s) so a long run can't fill disk
+                if time.perf_counter() - last_disk_check > 10.0:
+                    last_disk_check = time.perf_counter()
+                    if _free_disk_gb(_REC_DIR) < MIN_FREE_DISK_GB:
+                        stop_reason = "low disk"
+                        break
+                if seconds is not None and (time.perf_counter() - t_start) > seconds:
+                    stop_reason = "time"
+                    break
+                _pace(loop_start, LOOP_FPS)
+    except KeyboardInterrupt:
+        stop_reason = "Ctrl-C"
+    finally:
+        # ALWAYS flush + finalize, whatever stopped us. This is the crash-safety
+        # payoff: an interrupted session still closes cleanly with all buffered
+        # frames written and the manifest marked complete.
+        total = writer.close()
+
+    elapsed = time.perf_counter() - t_start
+    print(f"\nStopped ({stop_reason}). Session '{name}':")
+    print(f"  {total} frames across {writer.chunks_written} chunks, "
+          f"{elapsed:.0f}s, mean {total/max(elapsed,1e-9):.1f} FPS, "
+          f"{dropped} long-gap frames ({100*dropped/max(total,1):.1f}%).")
+    print(f"  Folder: {session_dir}")
+    if stop_reason == "low disk":
+        print("  NOTE: stopped because free disk fell below the floor — the "
+              "session up to here is complete and safe.")
+    print("  Inspect with: python -m src.inspect_recording "
+          f"{os.path.join('data', 'recordings', name)}")
+    return session_dir
 
 
 def verify(seconds=12.0):
@@ -495,15 +794,17 @@ def _build_parser():
     g.add_argument("--verify", action="store_true",
                    help="scripted-motion alignment check — RUN THIS FIRST")
     g.add_argument("--record", action="store_true",
-                   help="record a session to disk (.npz)")
+                   help="record an extended chunked session to disk (v2 folder)")
+    g.add_argument("--record-single", action="store_true",
+                   help="record one single-file .npz (v1; short round-trip check)")
     g.add_argument("--dryrun", action="store_true",
                    help="run the loop with a live readout, save nothing")
     g.add_argument("--profile", action="store_true",
                    help="time each loop stage to find what limits FPS (saves nothing)")
     p.add_argument("--seconds", type=float, default=None,
-                   help="duration; defaults per mode")
+                   help="duration; defaults per mode. Omit with --record to run until F8.")
     p.add_argument("--name", type=str, default=None,
-                   help="optional recording filename stub")
+                   help="optional recording name stub")
     return p
 
 
@@ -512,13 +813,16 @@ def main(argv=None):
     if args.verify:
         verify(seconds=args.seconds or 12.0)
     elif args.record:
+        record_session(seconds=args.seconds, name=args.name)
+    elif args.record_single:
         record(seconds=args.seconds or 60.0, name=args.name)
     elif args.dryrun:
         dryrun(seconds=args.seconds or 20.0)
     elif args.profile:
         profile(seconds=args.seconds or 20.0)
     else:
-        print("Choose a mode: --verify (do first), --dryrun, or --record.")
+        print("Choose a mode: --verify (do first), --record (extended), "
+              "--dryrun, or --profile.")
         print("See `python -m src.recorder -h`.")
 
 

@@ -1,34 +1,87 @@
 # DATA_FORMAT.md — Agentic-CS2 on-disk recording schema
 
-**Status: v1, locked 2026-08 (Issue #5).** This is the authoritative schema for
+**Status: v2, revised 2026-08 (Issue #4).** This is the authoritative schema for
 self-recorded session files. Every loader, trainer, and inspection tool reads
 this format; change it only by bumping `schema_version` and updating this file
 in the same commit (per the living-docs rule in CLAUDE.md).
 
+**v2 vs v1 (what changed and why):** v1 stored a whole session as one `.npz`.
+That accumulates every frame in RAM until the end and writes once — so a long
+session exhausts memory, and any crash loses the entire session (nothing is on
+disk until the loop finishes). v2 makes a session a **folder of chunk files**:
+the recorder flushes a chunk to disk periodically and frees that RAM, so memory
+is bounded and a crash loses at most the current in-progress chunk (Issue #4,
+D-018). **The per-frame array schema inside each chunk is byte-for-byte the v1
+schema** — only the container changed. v1 single-file recordings remain valid and
+readable; a v1 file is simply equivalent to a one-chunk session.
+
 Related decisions: **D-012** (capture geometry: fullscreen 1920x1080, full-frame
 crop, 150x270 model input), **D-015** (action fields: keys/clicks + raw mouse
-deltas), **D-016** (loop rate). This file is the schema those decisions produce.
+deltas), **D-016** (loop rate), **D-017** (v1 array schema), **D-018** (chunked
+sessions for crash-safety + bounded memory). This file is the schema those
+decisions produce.
 
 ---
 
-## File type and naming
+## Session structure (v2: a folder of chunks)
 
-- One **session** = one `.npz` file (NumPy compressed archive), written by
-  `src/recorder.py`.
-- Location: `data/recordings/` (gitignored — recordings are large and local).
-- Name: `session_YYYYMMDD_HHMMSS.npz` by default, or a caller-supplied stub.
+A **session** is a folder under `data/recordings/`, named
+`session_YYYYMMDD_HHMMSS/` (or a caller-supplied stub). Inside:
+
+```
+data/recordings/session_20260810_131408/
+  manifest.json          # session-level metadata + chunk list (see below)
+  chunk_00000.npz        # first chunk of frames+actions
+  chunk_00001.npz        # next chunk
+  ...
+  chunk_00042.npz.tmp    # (only if a crash happened mid-write; see recovery)
+```
+
+- Each `chunk_NNNNN.npz` holds a contiguous slice of the session's frames in the
+  **exact per-frame array schema below** (identical to v1). Chunks are ordered by
+  their zero-padded index; concatenating them in order reconstructs the full
+  session, and the sync/index-alignment guarantee holds *within* each chunk.
+- Each chunk is written to `chunk_NNNNN.npz.tmp` then atomically renamed to
+  `chunk_NNNNN.npz` on success. A leftover `.tmp` marks a chunk whose write was
+  interrupted by a crash — loaders ignore `.tmp` files; the rest of the session
+  is intact.
+- `manifest.json` records session-level info and the authoritative chunk list.
+  A loader reads the manifest, then the listed chunks in order.
 - Written with `np.savez_compressed`; read with `np.load(path, allow_pickle=False)`.
-  **`allow_pickle=False` is required** — the format uses only plain arrays
-  precisely so it never needs pickle (safer, portable, loader-friendly).
+  **`allow_pickle=False` is required** — the format uses only plain arrays.
+- **Back-compat:** a bare `session_*.npz` file (v1) is still valid — treat it as
+  a single-chunk session with no manifest.
+
+### manifest.json
+
+```json
+{
+  "schema_version": 2,
+  "session": "session_20260810_131408",
+  "geom": "fullscreen 1920x1080 -> crop L0T0W1920H1080 -> 270x150 BGR",
+  "loop_fps_target": 15,
+  "chunks": ["chunk_00000.npz", "chunk_00001.npz"],
+  "total_frames": 4833,
+  "complete": true
+}
+```
+
+`complete` is `false` while recording and set `true` on clean shutdown — so a
+session interrupted by a crash is identifiable (its manifest says `complete:
+false`, or the manifest lists fewer chunks than are on disk). The per-chunk
+`schema_version`/`geom`/`loop_fps_target` fields (below) are still written inside
+each chunk too, so a chunk remains self-describing even in isolation.
 
 ---
 
-## Arrays in each file
+## Arrays in each chunk
 
-`N` = number of frames in the session. Every **per-frame** array has length `N`
-along axis 0, and row `i` of every per-frame array corresponds to the **same
+`N` = number of frames **in that chunk**. Every **per-frame** array has length
+`N` along axis 0, and row `i` of every per-frame array corresponds to the **same
 tick** — this index-alignment IS the frame/action synchronization the M0 gate
-proved (#3). Do not sort or filter one array without the others.
+proved (#3). Do not sort or filter one array without the others. (To index across
+the whole session, walk chunks in order; a global frame index maps to a
+(chunk, local-index) pair.)
 
 ### Per-frame arrays (length N)
 
@@ -47,7 +100,7 @@ proved (#3). Do not sort or filter one array without the others.
 | Key | Shape | dtype | Meaning |
 |---|---|---|---|
 | `key_names` | (11,) | str (`<U…`) | The key label for each column of `keys`, in order: `w, a, s, d, space, ctrl, shift, 1, 2, 3, r`. Always read column meaning FROM THIS ARRAY, never assume the order. |
-| `schema_version` | () scalar | int | Format version. **1** for this document. A loader should check this and refuse/adapt if it sees a version it doesn't know. |
+| `schema_version` | () scalar | int | Format version. **2** for this document (chunked sessions). A loader should check this and refuse/adapt if it sees a version it doesn't know. A chunk from a v2 session carries 2; a legacy standalone v1 file carries 1. |
 | `geom` | (…) | str | Human-readable capture geometry stamp, e.g. `"fullscreen 1920x1080 -> crop full-frame -> 150x270 BGR"`. Records the conditions the frames were captured under so a file is self-describing without external context. |
 | `loop_fps_target` | () scalar | int | The loop's target FPS at record time (D-016: 15). The REAL rate is derivable from `timestamps`; this is just what was aimed for. |
 

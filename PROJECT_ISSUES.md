@@ -131,10 +131,14 @@ Log our own keyboard + mouse (including mouse deltas) and align each input to th
 
 ### M1 — Self-recorded action dataset
 
-#### #4 Recording tooling for extended sessions
+#### #4 Recording tooling for extended sessions  ✅ CLOSED (2026-08)
 **Labels:** `data` `infra` · **Depends on:** #3
 Turn the capture+log prototype into something usable for long sessions unattended: start/stop, disk management, crash resilience. Run a pilot; set the dataset size target (hours/frames) from pilot throughput.
-**Acceptance:** an extended session records without babysitting; size target committed.
+**Acceptance:** an extended session records without babysitting; size target committed. — **MET.**
+**Delivered:** `recorder.py` `record_session()` (behind `--record`) writing **chunked v2 sessions** via `ChunkedSessionWriter` with a **background writer thread** (D-019) so capture never stalls at a chunk boundary. Bounded memory (Option A, ~2-chunk depth), crash-safe (atomic `.tmp.npz`-then-rename per chunk + manifest; `finally`-block finalize so F8/timeout/Ctrl-C/exception all close cleanly, marked `complete` only if all writes succeeded). Disk management: refuses to start below 5 GB free, stops cleanly if free space crosses the floor mid-session. `--record-single` retains the v1 writer; `inspect_recording.py` reads both and localises stalls to chunk boundaries. Rationale: DECISIONS **D-018** (chunking) + **D-019** (threaded write).
+**Verified on-machine:** two 5-min sessions recorded, chunked (2–3 chunks), reloaded intact, aligned. After D-019 the boundary stall is gone — gaps at frames 1800/3600 are 82/69 ms (were 10,657 ms), whole-session slowest gap 127 ms, jitter 5.3 ms. Clean thread shutdown.
+**Throughput + SIZE TARGET (committed):** measured ~**3–4 GB/hour** at ~13 FPS (5-min run = 313 MB / 3862 frames). **Dataset target: record as much as practical, ~20 GB (≈ 5–7 hours of play).** User will clear disk space to accommodate. This is the volume #6 records.
+**Deliberately waived:** the explicit mid-session kill/crash test was consciously skipped (user call) — crash-safety is low-risk because each chunk is fully written + atomically renamed the moment it lands, so completed chunks can't be corrupted by a later kill, and clean-shutdown finalize is already verified. Noted here so a future session sees it was a choice, not an oversight.
 
 #### #5 Finalize data format  ✅ CLOSED (2026-08)
 **Labels:** `data` · **Depends on:** #3

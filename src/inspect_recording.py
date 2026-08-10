@@ -1,28 +1,28 @@
-"""inspect_recording.py — summarise and spot-check a recorded .npz session.
+"""inspect_recording.py — summarise and spot-check a recording.
 
-A reusable tool for looking inside recordings produced by `recorder.py --record`.
-Use it to confirm a session is well-formed and actually captured gameplay before
-trusting it: array shapes + alignment, key/click activity, mouse-delta ranges,
-the real frame rate derived from timestamps, and (optionally) a few frames dumped
-to PNG so you can SEE the images are real, not garbage.
+A reusable tool for looking inside recordings produced by `recorder.py`. Reads
+both formats: a **v2 session folder** (manifest.json + chunk_*.npz, D-018) and a
+legacy **v1 single .npz**. Use it to confirm a session is well-formed and
+actually captured gameplay before trusting it: array shapes + alignment,
+key/click activity, mouse-delta ranges, real frame rate from timestamps, and
+(optionally) a few frames dumped to PNG so you can SEE the images are real.
 
 Why both numbers and images: matching array shapes prove the record is
 structurally sound (frames and actions index-aligned), but only eyeballing a
 frame proves the capture actually grabbed the game. This tool does both.
 
 Usage:
-  python -m src.inspect_recording                         # newest recording
-  python -m src.inspect_recording <path-or-name>          # a specific one
-  python -m src.inspect_recording --dump 6                # also save 6 frames to PNG
-  python -m src.inspect_recording <name> --dump 6
+  python -m src.inspect_recording                    # newest recording (folder or file)
+  python -m src.inspect_recording <path-or-name>     # a specific one
+  python -m src.inspect_recording --dump 6           # also save 6 frames to PNG
 
-This is an inspection/QA tool, not part of the record or train path. It also
-reports the real per-frame timing (from saved timestamps), which is relevant to
-the open question of the recording loop's FPS.
+For v2 folders, frames/actions are concatenated across chunks in manifest order
+before analysis, so the summary is over the WHOLE session.
 """
 
 import argparse
 import glob
+import json
 import os
 
 import numpy as np
@@ -31,29 +31,112 @@ import numpy as np
 _REC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "recordings")
 _DUMP_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "capture_debug")
 
+_PER_FRAME = ["frames", "timestamps", "keys", "lclick", "rclick", "dx", "dy"]
 
-def _resolve_path(arg):
-    """Turn a user argument into a real .npz path, or find the newest recording."""
+
+def _resolve_target(arg):
+    """Return a path to inspect: a v2 session folder OR a v1 .npz file.
+
+    With no arg, picks the newest of either kind in data/recordings.
+    """
     if arg is None:
-        candidates = sorted(glob.glob(os.path.join(_REC_DIR, "*.npz")),
-                            key=os.path.getmtime)
+        # Newest among: session folders (with a manifest) and bare .npz files.
+        folders = [p for p in glob.glob(os.path.join(_REC_DIR, "*"))
+                   if os.path.isdir(p) and os.path.isfile(os.path.join(p, "manifest.json"))]
+        files = glob.glob(os.path.join(_REC_DIR, "*.npz"))
+        candidates = folders + files
         if not candidates:
             raise FileNotFoundError(
-                f"No .npz recordings found in {_REC_DIR}. Record one first with "
+                f"No recordings found in {_REC_DIR}. Record one with "
                 f"`python -m src.recorder --record`.")
-        return candidates[-1]  # newest by mtime
-    # Accept a full path, a path relative to cwd, or a bare name (with/without .npz)
-    if os.path.isfile(arg):
+        return max(candidates, key=os.path.getmtime)
+    # Explicit: accept a folder, a file, or a bare name for either.
+    if os.path.isdir(arg) or os.path.isfile(arg):
         return arg
+    in_rec = os.path.join(_REC_DIR, os.path.basename(arg))
+    if os.path.isdir(in_rec):
+        return in_rec
     cand = arg if arg.endswith(".npz") else arg + ".npz"
-    in_recdir = os.path.join(_REC_DIR, os.path.basename(cand))
-    if os.path.isfile(in_recdir):
-        return in_recdir
+    in_rec_file = os.path.join(_REC_DIR, os.path.basename(cand))
+    if os.path.isfile(in_rec_file):
+        return in_rec_file
     raise FileNotFoundError(f"Could not find recording: {arg}")
 
 
+def _load_npz(path):
+    """Load one .npz into a plain dict of arrays."""
+    out = {}
+    with np.load(path, allow_pickle=False) as d:
+        for k in d.files:
+            out[k] = d[k]
+    return out
+
+
+def _load_target(target):
+    """Load a v2 folder (concatenated) or v1 file into one arrays dict.
+
+    Returns (arrays_dict, meta_dict). meta_dict carries session-level info for
+    display (chunk count, completeness, on-disk size).
+    """
+    if os.path.isdir(target):
+        manifest_path = os.path.join(target, "manifest.json")
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        chunk_names = manifest.get("chunks", [])
+        if not chunk_names:
+            raise ValueError(f"Session {target} has no chunks listed in manifest.")
+        # Load each chunk; concatenate per-frame arrays in manifest order.
+        per_frame_lists = {k: [] for k in _PER_FRAME}
+        meta_arrays = {}
+        chunk_lengths = []
+        total_size = os.path.getsize(manifest_path)
+        for cname in chunk_names:
+            cpath = os.path.join(target, cname)
+            total_size += os.path.getsize(cpath)
+            chunk = _load_npz(cpath)
+            if "frames" in chunk:
+                chunk_lengths.append(int(chunk["frames"].shape[0]))
+            for k in _PER_FRAME:
+                if k in chunk:
+                    per_frame_lists[k].append(chunk[k])
+            # keep metadata from the first chunk
+            for k in ("key_names", "schema_version", "geom", "loop_fps_target"):
+                if k in chunk and k not in meta_arrays:
+                    meta_arrays[k] = chunk[k]
+        arrays = {}
+        for k, parts in per_frame_lists.items():
+            if parts:
+                arrays[k] = np.concatenate(parts, axis=0)
+        arrays.update(meta_arrays)
+        meta = {
+            "kind": "v2 session folder",
+            "chunks": len(chunk_names),
+            "complete": manifest.get("complete"),
+            "size_mb": total_size / (1024 * 1024),
+            "manifest_total_frames": manifest.get("total_frames"),
+            "chunk_lengths": chunk_lengths,
+        }
+        return arrays, meta
+    else:
+        arrays = _load_npz(target)
+        meta = {
+            "kind": "v1 single file",
+            "chunks": 1,
+            "complete": True,
+            "size_mb": os.path.getsize(target) / (1024 * 1024),
+            "manifest_total_frames": None,
+            "chunk_lengths": [int(arrays["frames"].shape[0])] if "frames" in arrays else [],
+        }
+        return arrays, meta
+
+
 def _fmt_hz(timestamps):
-    """Derive real FPS and gap stats from the saved perf_counter timestamps."""
+    """Derive real FPS and gap stats from the saved perf_counter timestamps.
+
+    Note: for a v2 session the timestamps are concatenated across chunks; the
+    gap between the last frame of one chunk and the first of the next is a real
+    inter-frame gap (recording was continuous), so this stays valid.
+    """
     if timestamps.size < 2:
         return None
     diffs = np.diff(timestamps)
@@ -68,14 +151,21 @@ def _fmt_hz(timestamps):
     }
 
 
-def inspect(path, dump=0):
-    print(f"Inspecting: {path}")
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    print(f"File size: {size_mb:.1f} MB\n")
+def inspect(target, dump=0):
+    arrays, meta = _load_target(target)
+    print(f"Inspecting: {target}")
+    print(f"Kind: {meta['kind']}"
+          + (f", {meta['chunks']} chunk(s)" if meta['chunks'] else "")
+          + (f", complete={meta['complete']}" if meta['complete'] is not None else ""))
+    print(f"On-disk size: {meta['size_mb']:.1f} MB")
+    if meta.get("manifest_total_frames") is not None:
+        print(f"Manifest total_frames: {meta['manifest_total_frames']}")
+    print()
 
-    with np.load(path, allow_pickle=False) as d:
-        keys_present = list(d.files)
-        print("Arrays in file (name, shape, dtype):")
+    d = arrays  # analysis below expects a dict-like of arrays
+    if True:
+        keys_present = list(d.keys())
+        print("Arrays (name, shape, dtype):")
         for k in keys_present:
             print(f"  {k:<12} {str(d[k].shape):<22} {d[k].dtype}")
         print()
@@ -116,6 +206,58 @@ def inspect(path, dump=0):
                       f"jitter {hz['jitter_ms']:.1f} ms)")
                 print(f"  slowest frame gap: {hz['max_dt_ms']:.1f} ms; "
                       f"fastest: {hz['min_dt_ms']:.1f} ms")
+                print()
+
+                # ── Stall localisation: are the big gaps at chunk boundaries? ──
+                # This is the diagnostic for the #4 flush-stall question. If the
+                # synchronous chunk flush is freezing the capture loop, the huge
+                # inter-frame gaps will land exactly at the chunk boundary frames
+                # (1800, 3600, ...). If the big gaps are elsewhere, the stall is
+                # something else (game/system hitch), handled differently.
+                ts = d["timestamps"]
+                diffs = np.diff(ts) * 1000.0  # ms gaps, index i = gap AFTER frame i
+                lengths = meta.get("chunk_lengths") or []
+                # boundary frame indices = cumulative chunk lengths (except the last)
+                boundaries = list(np.cumsum(lengths))[:-1] if len(lengths) > 1 else []
+                budget_ms = 1000.0 / (int(d["loop_fps_target"]) if "loop_fps_target" in d else LOOP_FPS)
+                stall_ms = 3.0 * budget_ms  # "stall" = gap > 3x the frame budget
+
+                # Top few gaps overall, with where they sit.
+                order = np.argsort(diffs)[::-1][:5]
+                print("  Largest inter-frame gaps (gap AFTER the listed frame index):")
+                for i in order:
+                    i = int(i)
+                    at_boundary = i + 1 in boundaries  # gap after frame i bridges to i+1
+                    tag = "  <-- CHUNK BOUNDARY" if at_boundary else ""
+                    print(f"    frame {i:>6}: {diffs[i]:8.1f} ms{tag}")
+
+                if boundaries:
+                    # Gap at each chunk boundary specifically.
+                    print("  Gap at each chunk boundary:")
+                    boundary_gaps = []
+                    for b in boundaries:
+                        gi = b - 1  # gap AFTER the last frame of the chunk
+                        if 0 <= gi < len(diffs):
+                            boundary_gaps.append(diffs[gi])
+                            print(f"    boundary at frame {b:>6}: {diffs[gi]:8.1f} ms")
+                    # Verdict.
+                    big = [g for g in diffs if g > stall_ms]
+                    big_at_boundary = sum(1 for b in boundaries
+                                          if 0 <= b - 1 < len(diffs) and diffs[b - 1] > stall_ms)
+                    print()
+                    if boundary_gaps and max(boundary_gaps) > stall_ms:
+                        frac = big_at_boundary / max(len(big), 1)
+                        print(f"  DIAGNOSIS: chunk-boundary gaps exceed {stall_ms:.0f} ms "
+                              f"(3x budget). {big_at_boundary} of {len(boundaries)} "
+                              f"boundaries stall; {frac*100:.0f}% of all stalls sit at "
+                              f"boundaries.")
+                        print("  => Consistent with the SYNCHRONOUS FLUSH blocking the "
+                              "loop. Fix: move the chunk write off the capture loop.")
+                    else:
+                        print("  DIAGNOSIS: chunk-boundary gaps are NOT the large ones — "
+                              "the stall is elsewhere (game/system hitch), not the flush.")
+                else:
+                    print("  (single chunk / no interior boundaries — no boundary test.)")
                 print()
 
         # ── Action activity ──
@@ -167,7 +309,8 @@ def inspect(path, dump=0):
                 return
             os.makedirs(_DUMP_DIR, exist_ok=True)
             idx = np.linspace(0, n - 1, min(dump, n)).astype(int)
-            stub = os.path.splitext(os.path.basename(path))[0]
+            stub = os.path.basename(str(target).rstrip(os.sep))
+            stub = os.path.splitext(stub)[0]  # drop .npz if a v1 file
             print(f"Dumping {len(idx)} frames to {_DUMP_DIR}:")
             for j in idx:
                 out = os.path.join(_DUMP_DIR, f"{stub}_frame_{int(j):05d}.png")
@@ -179,14 +322,14 @@ def inspect(path, dump=0):
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Summarise and spot-check a recorded .npz session.")
+        description="Summarise and spot-check a recording (v2 folder or v1 .npz).")
     p.add_argument("recording", nargs="?", default=None,
-                   help="path or name of the .npz (default: newest in data/recordings)")
+                   help="path or name of a session folder / .npz (default: newest)")
     p.add_argument("--dump", type=int, default=0, metavar="N",
                    help="also save N evenly-spaced frames as PNG for visual inspection")
     args = p.parse_args(argv)
-    path = _resolve_path(args.recording)
-    inspect(path, dump=args.dump)
+    target = _resolve_target(args.recording)
+    inspect(target, dump=args.dump)
 
 
 if __name__ == "__main__":
