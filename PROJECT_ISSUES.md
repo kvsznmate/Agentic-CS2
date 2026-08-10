@@ -103,10 +103,16 @@ Pin the stack (Python + capture libs + framework + numpy + OpenCV). Document set
 **Acceptance:** fresh checkout + docs yields a working env; smoke test imports core modules.
 **Delivered:** `environment.yml` (conda; native-Windows **TF 2.10 + CUDA 11.2 + Py 3.10**, GPU on the RTX 4050 — DECISIONS D-011, superseding D-009), `src/__init__.py`, `src/smoke_test.py` (import + version + GPU-detection check), `.gitignore`, setup docs in `README.md`. Capture lib settled as mss + crop (D-010). **Still to verify on-machine:** run `conda env create -f environment.yml` then `python -m src.smoke_test` and confirm `RESULT: all core imports succeeded. GPU visible.` — the env build itself hasn't been executed here, only specified. GPU detection depends on a current NVIDIA driver + the CUDA/cuDNN conda packages installing cleanly (see README GPU setup).
 
-#### #2 [GATE] CS2 screen capture
+#### #2 [GATE] CS2 screen capture  ✅ CLOSED (verified on-machine, 2026-08)
 **Labels:** `gate` `data` `infra` · **Depends on:** #1
 Capture the CS2 window. The legacy D3D9 BitBlt method is dead on Source 2 — use full-screen grab (mss) + crop to the game region, output the fixed model input size. Verify against different in-game scenes.
-**Acceptance:** clean, correctly-cropped frames captured live from CS2 at a usable rate.
+**Acceptance:** clean, correctly-cropped frames captured live from CS2 at a usable rate. — **MET.**
+**Delivered:** `src/capture.py` (mss grab + crop + resize to **150x270** BGR, `INTER_LINEAR`; persistent mss instance; `grab()` returns frame **plus a perf_counter timestamp** so #3 can sync inputs to it without a rewrite) and `src/capture_config.py` (per-machine geometry). Entry points: `--calibrate`, `--benchmark` (with grab-vs-resize timing split), `--preview`.
+**Setup (D-012):** CS2 fullscreen at native **1920x1080**; crop **full-frame**; model input **150x270 (16:9)** so the downscale carries no aspect distortion.
+**Verified on-machine:** `--calibrate` green box covers the full frame; `cropped.png` undistorted; `--preview` clean across scenes with the radar visible; `--benchmark` **~25 FPS** sustained.
+**Rate bar (D-014):** committed at **≥ 20 FPS**, met with margin at ~25. Deliberately not chasing 30 on capture-in-isolation — the meaningful budget is the full loop (capture + logging + inference), measured later. **dxcam** recorded as the deferred faster-capture lever (D-014) if the full loop later needs it.
+**Findings along the way:** profiling (D-013) overturned the assumption that mss was the sole bottleneck — the `INTER_AREA` resize was ~half the cost; switched to `INTER_LINEAR`. Both mss (~26 ms) and resize (~14 ms) are slower than ideal on this hardware (likely non-SIMD PyPI OpenCV + mss's generic Windows path), acceptable at the committed bar.
+**Scope reminder:** capture is only the FIRST HALF of the M0 gate. #3 (sync) is the real risk — #2 passing is NOT M0 passing.
 
 #### #3 [GATE] Synced input logging
 **Labels:** `gate` `data` · **Depends on:** #2
