@@ -14,14 +14,14 @@ A behavioural-cloning FPS agent that splits perception into two feeds: a **radar
 
 ## Milestones
 
-### M0 — Capture pipeline (GO/NO-GO)
+### M0 — Capture pipeline (GO/NO-GO)  ✅ PASSED (2026-08)
 **Goal:** prove we can capture clean, synchronized screen + input data on CS2 at all.
 **Exit criteria:**
-- Screen capture working on CS2 (mss full-screen grab + crop; the legacy D3D9 method is dead).
-- Our own keyboard/mouse inputs logged and time-synced to frames.
-- A short recorded session round-trips to disk and reloads intact.
-**Benchmark:** a 5-minute self-recorded session yields frame-action pairs with verified alignment (input at frame N actually corresponds to screen at frame N); dropped-frame rate under a set bar.
-**Kill condition:** if we can't capture synchronized data reliably, there is no project. Everything downstream depends on this. Resolve before anything else.
+- ✅ Screen capture working on CS2 (mss full-screen grab + crop; the legacy D3D9 method is dead). — #2 closed.
+- ✅ Our own keyboard/mouse inputs logged and time-synced to frames. — #3 closed; alignment verified across 3 runs.
+- ✅ A short recorded session round-trips to disk and reloads intact. — 5-min session, 4833 frames, reloaded intact.
+**Benchmark:** a 5-minute self-recorded session yields frame-action pairs with verified alignment (input at frame N actually corresponds to screen at frame N); dropped-frame rate under a set bar. — **MET** (alignment PASS; 0.0% long-gaps vs <2% bar; ~15 FPS vs ≥15 bar, D-016).
+**Outcome:** the project's central risk — can we make synchronized data on Source 2 at all — is resolved YES. Capture is mss+crop (D-010/D-012), aim is raw mouse deltas readable under the in-game cursor lock (D-015), the loop is a single synchronous design with input logging essentially free on top of capture (D-016). Next: M1 (#4 extended-session tooling, #5 lock the data format).
 
 ### M1 — Self-recorded action dataset
 **Goal:** enough of our own play to train movement + aim.
@@ -114,10 +114,18 @@ Capture the CS2 window. The legacy D3D9 BitBlt method is dead on Source 2 — us
 **Findings along the way:** profiling (D-013) overturned the assumption that mss was the sole bottleneck — the `INTER_AREA` resize was ~half the cost; switched to `INTER_LINEAR`. Both mss (~26 ms) and resize (~14 ms) are slower than ideal on this hardware (likely non-SIMD PyPI OpenCV + mss's generic Windows path), acceptable at the committed bar.
 **Scope reminder:** capture is only the FIRST HALF of the M0 gate. #3 (sync) is the real risk — #2 passing is NOT M0 passing.
 
-#### #3 [GATE] Synced input logging
+#### #3 [GATE] Synced input logging  ✅ CLOSED — verified on-machine (2026-08). **M0 GATE PASSED.**
 **Labels:** `gate` `data` · **Depends on:** #2
 Log our own keyboard + mouse (including mouse deltas) and align each input to the correct captured frame. Frame/input synchronization is the hard part, not the capture. Verify alignment explicitly.
-**Acceptance:** a short session produces frame-action pairs where input at frame N provably matches screen at frame N; dropped-frame rate under a committed bar. **If sync can't be made reliable, RAISE THE KILL FLAG.**
+**Acceptance:** a short session produces frame-action pairs where input at frame N provably matches screen at frame N; dropped-frame rate under a committed bar. — **MET.**
+**Delivered:** `src/raw_mouse.py` (raw-input WM_INPUT mouse listener, accumulates device dx/dy, read per frame; `--selftest`), `src/recorder.py` (single synchronous loop; `--verify` / `--record` / `--dryrun` / `--profile`; `.npz` writer with reload round-trip), `src/inspect_recording.py` (summarise + spot-check a recording). Approach in DECISIONS **D-015**.
+**Verified on-machine:**
+- Raw mouse deltas read cleanly **in-game under CS2's cursor lock** (the load-bearing bet of D-015) — `raw_mouse --selftest` confirmed dx/dy track physical motion where the study's GetCursorPos would freeze.
+- Alignment PASS, **consistent across 3 verify runs**: right-sweep 94–96% +dx, left-sweep 82–86% −dx, means cleanly separated (e.g. +40 vs −49) every run. Direction (the actual sync proof) never smeared; only a secondary reaction-time boundary metric ever flagged, since fixed (fixed-time tolerance).
+- Round-trip: a 5-min session saved 4833 frames to `.npz`, reloaded intact, arrays index-aligned (confirmed via `inspect_recording`).
+**Dropped-frame bar:** long-gap frames **0.0%** over the 5-min session — well under the < 2% bar. **MET.**
+**FPS (D-016):** recording runs at **~15 FPS**, committed bar ≥ 15, met. Profiling proved the loop is 100% bounded by the ~37 ms mss grab; input logging adds ~0.07 ms (free). Matches the study's 16 FPS working loop. dxcam is the documented lever (D-014) if the full agent loop later needs more.
+**This closes M0** — the first and most important gate. Synchronized screen+input capture on CS2 is proven. Everything downstream (radar signal #7, detection #10, the models) now has a real data pipeline to build on.
 
 ---
 
@@ -128,10 +136,12 @@ Log our own keyboard + mouse (including mouse deltas) and align each input to th
 Turn the capture+log prototype into something usable for long sessions unattended: start/stop, disk management, crash resilience. Run a pilot; set the dataset size target (hours/frames) from pilot throughput.
 **Acceptance:** an extended session records without babysitting; size target committed.
 
-#### #5 Finalize data format
+#### #5 Finalize data format  ✅ CLOSED (2026-08)
 **Labels:** `data` · **Depends on:** #3
 Lock the on-disk schema: frame image, action vector (keys, clicks, mouse dx/dy), and the radar crop region. Design for the loader and for later detection-label attachment.
-**Acceptance:** documented schema; sample files validate against it.
+**Acceptance:** documented schema; sample files validate against it. — **MET.**
+**Delivered:** `DATA_FORMAT.md` at the repo root — authoritative **v1** schema: `.npz` per session, per-frame arrays `frames` (N,150,270,3 uint8 BGR), `timestamps`, `keys` (N,11), `lclick`, `rclick`, `dx`, `dy`, all index-aligned (row i = one synchronized tick); metadata `key_names`, `schema_version`, `geom`, `loop_fps_target`. `recorder.py` updated to write the three self-description fields so files are interpretable without external context. Reads via `np.load(allow_pickle=False)`; validated by the existing round-trip check + `inspect_recording.py`.
+**Two deliberate scope calls:** (1) stores the **FULL frame**, not a radar crop — keeps the radar recoverable for the #7 gate and defers centre/radar sub-crops to the loader (#6), per D-012. The spec's "radar crop region" is intentionally NOT baked in yet: #7 hasn't proven the radar carries signal, and on-machine the 150x270 radar is very low-res (region-level only). (2) detection labels are **not** in the format — they're a separate data problem (M3); the schema is designed to accept them later as a new index-aligned per-frame array + a schema bump, without touching existing fields.
 
 #### #6 Record the first self-play dataset + loader
 **Labels:** `data` `infra` · **Depends on:** #4, #5
