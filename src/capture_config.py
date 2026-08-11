@@ -40,7 +40,7 @@ avoids a hidden dependence on the monitor's resolution.
 # mss numbers monitors from 1 (monitor 0 is the "all monitors" virtual union).
 # On a dual-monitor setup, set this to whichever physical monitor CS2 runs on.
 # Calibration prints the monitor list so you can pick correctly.
-MONITOR_INDEX = 1
+MONITOR_INDEX = 2
 
 # ── Game / display resolution (for reference / sanity checks) ─────────────
 # CS2 is run FULLSCREEN at the monitor's native 1920x1080 (16:9). Not used
@@ -76,3 +76,41 @@ MODEL_INPUT_HW = (150, 270)  # (height, width)
 # mss returns BGRA; capture.py drops alpha to BGR. Recorded here because the
 # channel order becomes part of the data contract finalized in #5.
 COLOR_FORMAT = "BGR"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RADAR REGION — for the two-resolution redesign (separate high-res radar crop)
+# ══════════════════════════════════════════════════════════════════════════
+# WHY THIS EXISTS: at the 150x270 model input the radar corner is too low-res to
+# read self-position (the #7 finding). The fix: store a SEPARATE, higher-res
+# radar crop taken from the FULL 1920x1080 grab BEFORE the aggressive FPV
+# downscale — the FPV stays 150x270, the radar gets its own array sized to its
+# own need (planned DATA_FORMAT.md v2 -> v3). See #7 / DECISIONS (entry added
+# once the format lands).
+#
+# ── MEASURED (2026-08), still PENDING ONE CONFIRMATION PASS ──
+# --radar-calibrate confirmed the radar is LEGIBLE when cropped from full-res
+# (uploaded radar_out.png: minimap, geometry, dots all readable). The initial
+# generous 320x320@(0,0) box included the HUD surround (dark border + empty
+# strip below the map). Tightened by grid-reading radar_src_grid.png: the minimap
+# disc runs ~(10,10) to ~(270,270) in the crop's local coords. Because that crop
+# started at full-frame (0,0), local == source here, so the source rectangle is
+# left=10 top=10 width=260 height=260. SQUARE minimap -> RADAR_OUT_HW stays
+# square (128x128), so the resize carries no aspect distortion (same principle as
+# D-012 for the FPV).
+#
+# STILL TO DO before this is baked into the recorder/format: run one more
+#     python -m src.capture --radar-calibrate --grid
+# and confirm radar_src.png is tight on the minimap with no dead border (these
+# bounds were eyeballed off a 20px grid, so good to ~±10px). Only then wire it
+# into the recorder + DATA_FORMAT.md v3 — the rectangle is baked into every file
+# at CAPTURE time, so it must be right before recording resumes.
+RADAR_SRC_LEFT = 10     # px, within the 1920x1080 frame  (measured; confirm once)
+RADAR_SRC_TOP = 10      # px                               (measured; confirm once)
+RADAR_SRC_WIDTH = 260   # px  (10..270)                    (measured; confirm once)
+RADAR_SRC_HEIGHT = 260  # px  (10..270)                    (measured; confirm once)
+
+# Size the radar crop is resized to for storage + the model (H, W). Square,
+# matching the square source region, so no aspect distortion. 128x128 is the
+# working choice for "enough to read position without bloating storage."
+RADAR_OUT_HW = (128, 128)  # (height, width)

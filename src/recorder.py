@@ -24,11 +24,14 @@ says RAISE THE KILL FLAG — so this file is built to expose failure, not hide i
 DECISIONS honoured:
   D-015  aim captured from raw mouse deltas (raw_mouse.py), not cursor position
          or memory-read view angles (both dead for us). Keys/clicks via pywin32.
+  D-024  two-resolution capture: the extended recorder stores a separate high-res
+         radar crop (128x128) alongside the 150x270 FPV, both from ONE grab
+         (Capture.grab_with_radar). Format bumped to v3. See DATA_FORMAT.md.
   single synchronous loop, per the way-one decision.
 
 Entry points:
   python -m src.recorder --verify     # scripted-motion alignment check (DO FIRST)
-  python -m src.recorder --record     # record a session to disk
+  python -m src.recorder --record     # record an extended chunked session (v3)
   python -m src.recorder --dryrun     # loop + live readout, write nothing
 """
 
@@ -52,23 +55,30 @@ from src.raw_mouse import RawMouseListener
 # local — see .gitignore and PROJECT_ISSUES #4/#5).
 _REC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "recordings")
 
+# On-disk schema version this recorder writes (DATA_FORMAT.md). v3 adds the
+# per-frame `radar` array (D-024) to the v2 chunked format.
+SCHEMA_VERSION = 3
+
 # Target loop rate. Profiling (D-016) showed the loop is entirely bounded by the
 # ~37 ms mss grab; input logging is free. Realised recording rate is ~15 FPS, so
 # the loop targets 15 rather than an unreachable 20. Matches the study's 16 FPS
 # working loop. dxcam is the documented lever (D-014) if the full agent loop
-# (with model inference) later needs more headroom.
+# (with model inference) later needs more headroom. D-024's radar crop adds a
+# small per-frame cost on top; --profile measures it.
 LOOP_FPS = 15
 
 # ── Chunked-session parameters (Issue #4 / D-018) ──────────────────────────
 # A long session is written as a folder of chunk files so memory stays bounded
-# and a crash loses at most one in-progress chunk. At 15 FPS a 150x270x3 frame
-# is ~121 KB uncompressed, ~1.8 MB/s, so 1800 frames (~2 min) is a few hundred MB
-# in RAM per chunk before flush — comfortable, and a good crash-loss granularity.
+# and a crash loses at most one in-progress chunk. At 15 FPS a 150x270x3 FPV
+# frame is ~121 KB and a 128x128x3 radar is ~49 KB (~170 KB/frame total, D-024),
+# ~2.6 MB/s, so 1800 frames (~2 min) is a few hundred MB in RAM per chunk before
+# flush — comfortable, and a good crash-loss granularity.
 CHUNK_FRAMES = 1800  # flush a chunk every this many frames (~2 min at 15 FPS)
 
 # Refuse to start / keep recording if free disk space falls below this, so a long
-# unattended session can't fill the drive. ~6.6 GB/hour uncompressed is the
-# budget (DATA_FORMAT.md); compressed is less but we stay conservative.
+# unattended session can't fill the drive. With the radar array the uncompressed
+# budget is ~9 GB/hour (DATA_FORMAT.md v3); compressed is less but we stay
+# conservative.
 MIN_FREE_DISK_GB = 5.0
 
 # ── Keys we log ───────────────────────────────────────────────────────────
@@ -130,17 +140,21 @@ class Recorder:
         self.cap.__exit__(*exc)
 
     def read_frame_record(self):
-        """One synchronized tick -> (frame, record_dict).
+        """One synchronized tick -> (frame, radar, record_dict).
 
         Order is deliberate (see module docstring): mouse delta first (closes the
         interval ending at this frame), then keys/clicks, then the frame grab
         last so its timing matches inference. All share the frame's capture
         timestamp as the single alignment anchor.
+
+        Returns the FPV frame AND the high-res radar crop (D-024), both from the
+        SAME grab via Capture.grab_with_radar, so the two feeds are inherently
+        synchronized (same instant, one grab).
         """
         dx, dy = self.mouse.read_and_reset()
         keys = _read_keys()
         lclick, rclick = _read_clicks()
-        frame, t_cap = self.cap.grab()
+        frame, radar, t_cap = self.cap.grab_with_radar()
         record = {
             "t": t_cap,          # capture timestamp (perf_counter) — the anchor
             "keys": keys,        # 0/1 over LOGGED_KEYS order
@@ -149,7 +163,7 @@ class Recorder:
             "dx": dx,            # summed raw mouse dx since last frame
             "dy": dy,
         }
-        return frame, record
+        return frame, radar, record
 
 
 def _pace(loop_start, fps):
@@ -176,7 +190,7 @@ def dryrun(seconds=20.0):
             loop_start = time.perf_counter()
             if _key_down(VK_QUIT):
                 break
-            _frame, r = rec.read_frame_record()
+            _frame, _radar, r = rec.read_frame_record()
             n += 1
             if n % 5 == 0:  # don't spam every frame
                 held = [key_names[i] for i, v in enumerate(r["keys"]) if v]
@@ -191,12 +205,13 @@ def dryrun(seconds=20.0):
 def profile(seconds=20.0):
     """Time each loop stage separately to find what limits the recording FPS.
 
-    `--record` reported ~14.8 FPS, below the ~25 capture-alone rate and our 20
-    target. This breaks the per-frame cost into its parts — mouse read, key/click
-    read, frame grab, record assembly — so we know whether the mss grab dominates
-    (expected, per D-013/D-014; then a lower floor is just honest) or something
-    cheaper is the culprit. Runs the REAL work each tick but saves nothing and
-    does NOT pace, so the numbers reflect raw stage cost, not the sleep.
+    Breaks the per-frame cost into its parts — mouse read, key/click read, the
+    grab-with-radar (FPV + radar crop), record assembly — so we know whether the
+    mss grab dominates (expected, per D-013/D-014; then a lower floor is honest)
+    or something cheaper is the culprit. Since D-024 added the radar crop+resize
+    to the grab stage, this is also the honest place to see its cost. Runs the
+    REAL work each tick but saves nothing and does NOT pace, so the numbers
+    reflect raw stage cost, not the sleep.
 
     Play normally (move + look) so the mouse/key paths do representative work.
     Press F8 to stop.
@@ -216,12 +231,13 @@ def profile(seconds=20.0):
             keys = _read_keys()
             lclick, rclick = _read_clicks()
             t2 = time.perf_counter()
-            frame, t_cap = rec.cap.grab()
+            frame, radar, t_cap = rec.cap.grab_with_radar()
             t3 = time.perf_counter()
-            # record assembly + list append, mirroring record()'s real work
+            # record assembly + array casts, mirroring the writer's real work
             _rec = {"t": t_cap, "keys": keys, "lclick": lclick,
                     "rclick": rclick, "dx": dx, "dy": dy}
-            _ = np.asarray(frame, dtype=np.uint8)  # the per-frame array cost
+            _ = np.asarray(frame, dtype=np.uint8)
+            _ = np.asarray(radar, dtype=np.uint8)
             t4 = time.perf_counter()
             mouse_t += t1 - t0
             keys_t += t2 - t1
@@ -241,16 +257,16 @@ def profile(seconds=20.0):
           f"(unpaced, no sleep)")
     print("Stage breakdown (ms/frame and share):")
     for label, t in [("mouse read", mouse_t), ("keys+clicks", keys_t),
-                     ("frame grab (mss+resize)", grab_t),
+                     ("grab+radar (mss+2 resizes)", grab_t),
                      ("record assembly", asm_t)]:
         ms = t / n * 1000.0
-        print(f"  {label:<26} {ms:6.2f} ms  ({ms/per_frame_ms*100:4.0f}%)")
+        print(f"  {label:<28} {ms:6.2f} ms  ({ms/per_frame_ms*100:4.0f}%)")
     print()
     if grab_t > 0.6 * total:
-        print("Diagnosis: the frame grab dominates. This is the known slow mss +")
-        print("resize path (D-013/D-014) — expected, not a loop bug. A lower FPS")
-        print("floor is honest; dxcam is the documented lever if the full agent")
-        print("loop later needs more (D-014).")
+        print("Diagnosis: the grab (mss + FPV resize + radar crop/resize) dominates.")
+        print("This is the known slow mss path (D-013/D-014) plus D-024's radar")
+        print("work — expected, not a loop bug. A lower FPS floor is honest; dxcam")
+        print("is the documented lever if the full agent loop later needs more.")
     else:
         print("Diagnosis: the grab is NOT the sole cost — another stage is a large")
         print("share. Worth a closer look before enshrining a floor; see which row")
@@ -259,12 +275,15 @@ def profile(seconds=20.0):
 
 
 def _geom_string():
-    """Human-readable capture-geometry stamp for self-describing files (D-017)."""
+    """Human-readable capture-geometry stamp for self-describing files (D-017/D-024)."""
     gw, gh = cfg.GAME_RES
     ih, iw = cfg.MODEL_INPUT_HW
+    rh, rw = cfg.RADAR_OUT_HW
     return (f"fullscreen {gw}x{gh} -> crop "
             f"L{cfg.CROP_LEFT}T{cfg.CROP_TOP}W{cfg.CROP_WIDTH}H{cfg.CROP_HEIGHT} "
-            f"-> {iw}x{ih} {cfg.COLOR_FORMAT}")
+            f"-> FPV {iw}x{ih} {cfg.COLOR_FORMAT}; "
+            f"radar src L{cfg.RADAR_SRC_LEFT}T{cfg.RADAR_SRC_TOP}"
+            f"W{cfg.RADAR_SRC_WIDTH}H{cfg.RADAR_SRC_HEIGHT} -> {rw}x{rh} {cfg.COLOR_FORMAT}")
 
 
 def _free_disk_gb(path):
@@ -283,6 +302,10 @@ class ChunkedSessionWriter:
     ~10 s capture stall the earlier synchronous flush caused at every chunk
     boundary (D-018).
 
+    v3 (D-024): each chunk now also holds a per-frame `radar` array, buffered and
+    written the same way as `frames`. Nothing about the threading/crash-safety
+    changes — the radar is just another index-aligned per-frame array.
+
     Sync-safety (important, re D-015): the writer thread touches ONLY finished,
     handed-off buffers. It never touches the capture, the timestamps, or the
     mouse listener. The frame/input alignment path stays fully synchronous and
@@ -297,8 +320,8 @@ class ChunkedSessionWriter:
 
     Usage:
         w = ChunkedSessionWriter(session_dir)
-        for each tick: w.add(frame, record)   # buffers; auto-flushes each chunk
-        w.close()                              # drains queue, marks complete
+        for each tick: w.add(frame, radar, record)   # buffers; auto-flushes
+        w.close()                                     # drains queue, marks complete
     """
 
     def __init__(self, session_dir, chunk_frames=CHUNK_FRAMES):
@@ -326,12 +349,13 @@ class ChunkedSessionWriter:
     @staticmethod
     def _empty_buffer():
         return {"t": [], "keys": [], "lclick": [], "rclick": [], "dx": [], "dy": [],
-                "frames": []}
+                "frames": [], "radar": []}
 
-    def add(self, frame, record):
+    def add(self, frame, radar, record):
         """Buffer one tick; hand off a chunk when the buffer reaches chunk_frames."""
         b = self._buf
         b["frames"].append(frame)
+        b["radar"].append(radar)
         b["t"].append(record["t"])
         b["keys"].append(record["keys"])
         b["lclick"].append(record["lclick"])
@@ -390,10 +414,11 @@ class ChunkedSessionWriter:
         # ".tmp.npz" and the os.replace would fail. .npz-suffixed temp avoids that.
         tmp = os.path.join(self.dir, f"chunk_{idx:05d}.tmp.npz")
         arrays = {
-            "schema_version": np.array(2),
+            "schema_version": np.array(SCHEMA_VERSION),
             "geom": np.array(self._geom),
             "loop_fps_target": np.array(LOOP_FPS),
             "frames": np.asarray(b["frames"], dtype=np.uint8),
+            "radar": np.asarray(b["radar"], dtype=np.uint8),   # v3 (D-024)
             "timestamps": np.asarray(b["t"], dtype=np.float64),
             "keys": np.asarray(b["keys"], dtype=np.uint8),
             "key_names": np.array([k for k, _ in LOGGED_KEYS]),
@@ -407,7 +432,7 @@ class ChunkedSessionWriter:
 
     def _write_manifest(self, complete):
         manifest = {
-            "schema_version": 2,
+            "schema_version": SCHEMA_VERSION,
             "session": self.session_name,
             "geom": self._geom,
             "loop_fps_target": LOOP_FPS,
@@ -454,17 +479,17 @@ class ChunkedSessionWriter:
 
 
 def record(seconds=60.0, name=None):
-    """Record a session to disk as an .npz: frames + aligned action arrays.
+    """LEGACY single-file recorder (v1, FPV-only). Kept for the short round-trip
+    check via --record-single; NOT updated for the radar (D-024).
 
-    A session that round-trips to disk and reloads intact. Frames and action
-    arrays are stored index-aligned: row i of every per-frame array corresponds
-    to frame i.
+    v3 (radar + FPV) is the chunked path in record_session(). This one-file writer
+    predates the radar and stays FPV-only on purpose: it exists only as a quick
+    self-contained round-trip smoke test, and a v1 file remains a valid FPV-only
+    single-chunk session. Do not use it to build the #7 radar dataset — use
+    --record (record_session), which writes v3 with the radar.
 
-    FORMAT: this writes the authoritative v1 schema locked in Issue #5 — see
-    DATA_FORMAT.md at the repo root for the full field list, dtypes, and the
-    self-description fields (schema_version / geom / loop_fps_target). Any change
-    to what's written here must bump schema_version and update DATA_FORMAT.md in
-    the same commit.
+    Writes the v1 schema (DATA_FORMAT.md): frames + aligned action arrays,
+    index-aligned (row i of every per-frame array is frame i).
     """
     os.makedirs(_REC_DIR, exist_ok=True)
     if name is None:
@@ -479,8 +504,11 @@ def record(seconds=60.0, name=None):
     dxs = []
     dys = []
 
-    print(f"Recording to {path}. Press F8 to stop (or after {seconds:.0f}s).")
-    print("Play normally. Keep CS2 focused and in-game.\n")
+    print(f"[LEGACY v1, FPV-only] Recording to {path}. Press F8 to stop "
+          f"(or after {seconds:.0f}s).")
+    print("Play normally. Keep CS2 focused and in-game.")
+    print("NOTE: this path stores NO radar (D-024). For the radar dataset use "
+          "--record.\n")
     dropped = 0
     with Recorder() as rec:
         n = 0
@@ -490,7 +518,7 @@ def record(seconds=60.0, name=None):
             loop_start = time.perf_counter()
             if _key_down(VK_QUIT):
                 break
-            frame, r = rec.read_frame_record()
+            frame, _radar, r = rec.read_frame_record()  # radar grabbed but not stored here
             frames.append(frame)
             ts.append(r["t"])
             keys.append(r["keys"])
@@ -516,15 +544,10 @@ def record(seconds=60.0, name=None):
     frames = np.asarray(frames, dtype=np.uint8)
     ts = np.asarray(ts, dtype=np.float64)
     keys = np.asarray(keys, dtype=np.uint8)
-    gw, gh = cfg.GAME_RES
-    ih, iw = cfg.MODEL_INPUT_HW
-    geom = (f"fullscreen {gw}x{gh} -> crop "
-            f"L{cfg.CROP_LEFT}T{cfg.CROP_TOP}W{cfg.CROP_WIDTH}H{cfg.CROP_HEIGHT} "
-            f"-> {iw}x{ih} {cfg.COLOR_FORMAT}")
     actions = {
-        # ── schema self-description (DATA_FORMAT.md v1, Issue #5) ──
+        # ── schema self-description (DATA_FORMAT.md v1) ──
         "schema_version": np.array(1),
-        "geom": np.array(geom),
+        "geom": np.array(_geom_string()),
         "loop_fps_target": np.array(LOOP_FPS),
         # ── per-frame arrays (length N, index-aligned to frames) ──
         "timestamps": ts,
@@ -552,19 +575,21 @@ def record(seconds=60.0, name=None):
 
 
 def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
-    """Extended chunked recording (Issue #4) — the real long-session recorder.
+    """Extended chunked recording (Issue #4, v3 with radar per D-024).
 
-    Writes a v2 session folder (DATA_FORMAT.md): chunks flushed every
-    `chunk_frames` frames so memory stays bounded and a crash loses at most one
-    in-progress chunk. Runs until F8, until `seconds` elapses (if given), or
-    until interrupted — and in every one of those cases the buffered frames are
+    Writes a v3 session folder (DATA_FORMAT.md): each frame stores the 150x270
+    FPV AND the 128x128 high-res radar crop, both from one grab, index-aligned.
+    Chunks flushed every `chunk_frames` frames so memory stays bounded and a crash
+    loses at most one in-progress chunk. Runs until F8, until `seconds` elapses
+    (if given), or until interrupted — and in every case the buffered frames are
     flushed and the manifest marked complete, so you never lose a clean session.
 
     Disk safety: refuses to start below MIN_FREE_DISK_GB, and stops cleanly if
     free space crosses that floor mid-session, so an unattended run can't fill
     the drive.
 
-    This is what #4 means by "usable for extended sessions without babysitting."
+    This is what #4 means by "usable for extended sessions without babysitting,"
+    now producing the two-feed data the radar gate (#7) needs.
     """
     os.makedirs(_REC_DIR, exist_ok=True)
     if name is None:
@@ -578,7 +603,8 @@ def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
         return None
 
     dur = f"{seconds:.0f}s" if seconds else "until F8"
-    print(f"Recording session '{name}' ({dur}). Press F8 to stop.")
+    print(f"Recording session '{name}' ({dur}), v{SCHEMA_VERSION} (FPV + radar). "
+          f"Press F8 to stop.")
     print(f"  chunks every {chunk_frames} frames (~{chunk_frames/LOOP_FPS:.0f}s), "
           f"{free:.1f} GB free, floor {MIN_FREE_DISK_GB:.0f} GB.")
     print("  Play normally. Keep CS2 focused and in-game.\n")
@@ -597,8 +623,8 @@ def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
                 if _key_down(VK_QUIT):
                     stop_reason = "F8"
                     break
-                frame, r = rec.read_frame_record()
-                writer.add(frame, r)
+                frame, radar, r = rec.read_frame_record()
+                writer.add(frame, radar, r)
                 if last_t is not None and (r["t"] - last_t) > 1.8 / LOOP_FPS:
                     dropped += 1
                 last_t = r["t"]
@@ -656,7 +682,8 @@ def verify(seconds=12.0):
 
     If the phases don't separate cleanly, sync (or raw-mouse reading) is not
     trustworthy — investigate before recording real data; per #3, consider the
-    kill flag.
+    kill flag. (Uses the same grab_with_radar path as recording, so it exercises
+    the real loop including D-024's radar crop.)
     """
     print("ALIGNMENT VERIFY. Follow the prompts. Keep CS2 focused and in-game\n"
           "(cursor locked) so this tests the real conditions.\n")
@@ -671,7 +698,7 @@ def verify(seconds=12.0):
         phase_marks.append((0, "RIGHT"))
         while time.perf_counter() - t_start < half:
             loop_start = time.perf_counter()
-            _frame, r = rec.read_frame_record()
+            _frame, _radar, r = rec.read_frame_record()
             records.append(r)
             _pace(loop_start, LOOP_FPS)
 
@@ -681,7 +708,7 @@ def verify(seconds=12.0):
         t_start = time.perf_counter()
         while time.perf_counter() - t_start < half:
             loop_start = time.perf_counter()
-            _frame, r = rec.read_frame_record()
+            _frame, _radar, r = rec.read_frame_record()
             records.append(r)
             _pace(loop_start, LOOP_FPS)
 
@@ -708,8 +735,6 @@ def verify(seconds=12.0):
     # (dx != 0). A hand sweep has natural pauses between strokes that log dx=0;
     # counting those zeros against the ratio is wrong — the question is "when you
     # moved, did it move the right way," not "did you move every single frame."
-    # The earlier version divided by all frames incl. zeros and produced false
-    # FAILs on clean data. This measures the actual thing.
     r_moved = right_dx[right_dx != 0]
     l_moved = left_dx[left_dx != 0]
     r_pos_frac = (r_moved > 0).mean() if r_moved.size else 0.0
@@ -720,19 +745,9 @@ def verify(seconds=12.0):
     print(f"  LEFT:  of {l_moved.size} moving frames, {l_neg_frac*100:.0f}% "
           f"were leftward (-dx).")
 
-    # Pass each phase if the means clearly separate AND, among moving frames, the
-    # intended direction dominates (>=80%). Means-separation is the primary
-    # evidence sync works; the fraction guards against a near-random mix.
     ok_right = right_dx.size > 0 and right_dx.mean() > 0 and r_pos_frac >= 0.8
     ok_left = left_dx.size > 0 and left_dx.mean() < 0 and l_neg_frac >= 0.8
 
-    # Where does the data actually switch from right-dominant to left-dominant?
-    # NOT "first negative frame" — hand motion jitters, and a single negative
-    # sample at the start is normal, not the transition. Instead find the split
-    # index k that best separates "mostly positive before k" from "mostly
-    # negative after k", by maximising correctly-classified frames. That locates
-    # the real behavioural boundary robustly, then we check it lands near where
-    # you were actually told to switch (`split`).
     best_k = None
     best_score = -1
     for k in range(1, n):
@@ -740,8 +755,6 @@ def verify(seconds=12.0):
         if correct > best_score:
             best_score = correct
             best_k = k
-    # Fraction of frames consistent with a single switch at best_k — a cleanliness
-    # measure. ~1.0 means the two phases are almost perfectly separated.
     separation = best_score / n if n else 0.0
 
     print()
@@ -753,12 +766,6 @@ def verify(seconds=12.0):
         print(f"  Offset between the two: {drift} frame(s) "
               f"(small = the input timeline tracks the frame timeline).")
 
-    # A trustworthy result: both phases separate by direction AND the data's
-    # own switch point sits close to where you actually switched. The tolerance
-    # is a fixed TIME (~1.5s), not a frame-percentage: the offset is dominated by
-    # human reaction to the "switch" prompt, which is a wall-clock lag, so a
-    # frame-fraction tolerance wrongly tightened on shorter/faster sessions.
-    # (Earlier frame-% version flagged clean data as MOSTLY-OK on short runs.)
     reaction_tol_frames = int(1.5 * LOOP_FPS)
     boundary_ok = best_k is not None and abs(best_k - split) <= reaction_tol_frames
 
@@ -789,14 +796,15 @@ def verify(seconds=12.0):
 
 def _build_parser():
     p = argparse.ArgumentParser(
-        description="Synchronized frame+input recorder (Issue #3, M0 gate).")
+        description="Synchronized frame+input recorder (Issue #3, M0 gate; "
+                    "v3 FPV+radar per D-024).")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--verify", action="store_true",
                    help="scripted-motion alignment check — RUN THIS FIRST")
     g.add_argument("--record", action="store_true",
-                   help="record an extended chunked session to disk (v2 folder)")
+                   help="record an extended chunked session to disk (v3 folder: FPV+radar)")
     g.add_argument("--record-single", action="store_true",
-                   help="record one single-file .npz (v1; short round-trip check)")
+                   help="record one single-file .npz (LEGACY v1, FPV-only; round-trip check)")
     g.add_argument("--dryrun", action="store_true",
                    help="run the loop with a live readout, save nothing")
     g.add_argument("--profile", action="store_true",
@@ -821,7 +829,7 @@ def main(argv=None):
     elif args.profile:
         profile(seconds=args.seconds or 20.0)
     else:
-        print("Choose a mode: --verify (do first), --record (extended), "
+        print("Choose a mode: --verify (do first), --record (extended v3), "
               "--dryrun, or --profile.")
         print("See `python -m src.recorder -h`.")
 
