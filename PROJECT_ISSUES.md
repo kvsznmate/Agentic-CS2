@@ -165,6 +165,20 @@ Record the target volume of our own play. Build a loader emitting (input, action
 
 **Sequence layer added (2026-08, D-027):** `src/sequence_loader.py` sits on top of this loader to serve sliding-window SEQUENCES (T consecutive frames -> last-frame action) for the recurrent baseline, reusing `SessionDataset` for all decoding/cropping/radar/action-assembly and adding only a windowing index. It preserves the two invariants (never spans a session boundary per D-021; never bridges a keep-mask gap per D-026) — both unit-tested. This does not change #6's acceptance; it's the consumer the baseline (#11-adjacent, and #7 via D-028) builds on.
 
+#### #21 GSI alive/gameplay filtering — feasibility DONE, integration OPEN
+**Labels:** `data` `infra` · **Depends on:** #4, #5
+Get an AUTHORITATIVE "is the local player alive / is this real gameplay" signal from the game itself, so spectating/menu/halftime frames never enter the training set — replacing manual alive-only recording (error-prone, doesn't scale) and upgrading the D-026 radar-variance keep-mask (which can't catch menu-open-but-radar-present junk). Approach + rationale in DECISIONS **D-030**.
+**Acceptance:** (1) prove CS2 emits the local alive/health state on this machine; (2) store a per-frame `alive`/`round_phase` field in the recording format; (3) the loader can filter to gameplay-only frames on opt-in.
+
+**Status of the three parts:**
+- **(1) Feasibility — ✅ DONE, CONFIRMED ON-MACHINE (2026-08-19).** `src/gsi_probe.py` (standalone localhost HTTP listener; stamps every GSI POST with `perf_counter` — the recorder's frame clock — prints alive/dead + weapon + phase on change; logs all payloads to `data/gsi_probe/*.jsonl`) + `gsi/gamestate_integration_agenticcs2.cfg` (subscribes `provider`/`map`/`round`/`player_id`/`player_state`/`player_weapons`) + `gsi/README.md`. Ran against a local game: local `player_state` seen, health tracked reality, death edge fired, weapon/ammo came through, die-and-spectate transition observed. `_extract()` parsing unit-tested against alive/dead/spectating/warmup/weapon payloads. **GSI confirmed alive on CS2 in 2026** (web-verified + maintained third-party CS2 GSI libs) — unlike the dead RAM-offset path (D-002/D-015).
+- **(2) DATA_FORMAT change — ☐ OPEN.** Add a per-frame `alive` (and likely `round_phase`) array to the schema (this is #5 / DATA_FORMAT.md territory — a schema bump, same index-aligned-per-frame-array pattern detection labels will use). Not started.
+- **(3) Recorder integration + loader filter — ☐ OPEN, has a real design problem.** Folding GSI into recording is non-trivial: GSI is **push/throttled event-driven HTTP**, while the capture loop is deliberately **single-threaded** (D-015 "way one"). So the GSI stream has to be received off the capture thread and its latest alive/phase state sampled per frame — and because GSI updates may arrive coarser than the ~67 ms frame interval, the flag must be **forward-filled** between updates, not treated as per-frame precise. On the loader side this is naturally the same shape as D-026's opt-in keep-mask (exclude non-gameplay frames by leaving them out of the index), so gameplay-filtering can likely reuse that mechanism with an authoritative source instead of (or alongside) the variance heuristic.
+
+**Two hard limits GSI does NOT solve (recorded so they're not re-explored):** enemy/world positions are OBSERVER-only (`allplayers_position`), so GSI gives **nothing** for detection labels — #8 stays a separate FPV vision + labelling problem (see the note on #8). And round-*time* countdown (`phase_countdowns`) is observer-only too, so M5's panel gets only coarse `round.phase` from live play, not exact seconds.
+
+**#21 does NOT close until parts (2) and (3) land** — feasibility passing is Step 1 only, exactly like #2 passing was not M0 passing.
+
 ---
 
 ### M2 — GO/NO-GO: Radar carries navigation signal
@@ -195,6 +209,7 @@ On our own frames, the go/no-go: check whether WASD is predictable from the rada
 **Labels:** `gate` `data` `combat` · **Depends on:** #5
 Self-recording yields no enemy-position labels — this issue decides how to get them. Evaluate options: manual annotation of a subset, semi-automated labeling, or an automated ground-truth source. Assess throughput and label quality on a pilot. This is a real sub-project, not a task.
 **Acceptance:** a chosen method with measured throughput + quality on a pilot batch.
+**GSI ruled OUT as the automated source (2026-08, D-030):** the obvious hope — read enemy positions from the game like the reference study did — does not work here. GSI only exposes other players' positions via the OBSERVER-only `allplayers_position` block, unavailable in live solo play (confirmed against the GSI spec while building #21). So the automated-ground-truth route via GSI is closed for a solo agent; #8's real options remain manual annotation, semi-automated labelling, or a pretrained-detector bootstrap on the FPV. (The observer-only path is exactly the spectating stretch #19 — out of scope for the critical path.)
 
 #### #9 Create the labeled detection subset
 **Labels:** `data` `combat` · **Depends on:** #8
