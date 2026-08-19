@@ -31,6 +31,7 @@ A behavioural-cloning FPS agent that splits perception into two feeds: a **radar
 - Data format finalized (frame image + action vector + **separate high-res radar image**, D-024).
 **Benchmark:** N hours / M frames recorded (target committed in #4 after a pilot); a loader emits (input, action-label) batches; held-out split reserved.
 **Scope note:** actions come free from self-recording. Detection labels do NOT — that's M3.
+**Modelling note (2026-08):** the first MODEL now exists — a WASD-from-FPV recurrent baseline (`src/model_lstm.py` + `src/sequence_loader.py`, D-027), the one thing trainable with zero new labels (recorded keys ARE the labels, D-003). Windowing logic is unit-tested; the TF model is built but UNRUN on-machine. This is M1's payoff (movement is trainable now) and doubles as the #7 radar test (D-028). It does NOT change M1's remaining bar: the committed baseline number still awaits the ~20 GB dataset (D-020), because an LSTM overfits the current ~15k frames fast — the trainer marks sub-volume results PROVISIONAL.
 
 ### M2 — GO/NO-GO: Radar carries navigation signal
 **Goal:** prove the radar is extractable and predicts movement, on our data.
@@ -162,6 +163,8 @@ Record the target volume of our own play. Build a loader emitting (input, action
 
 **#6 does NOT close until the ~20 GB of v3 data is recorded + documented.** The loader, split, and tests are done; the dataset volume is the remaining bar. Only then are #7 (radar), #10 (detection), #11 (aim) truly unblocked on real data volume — though the loader is available now for their scaffolding.
 
+**Sequence layer added (2026-08, D-027):** `src/sequence_loader.py` sits on top of this loader to serve sliding-window SEQUENCES (T consecutive frames -> last-frame action) for the recurrent baseline, reusing `SessionDataset` for all decoding/cropping/radar/action-assembly and adding only a windowing index. It preserves the two invariants (never spans a session boundary per D-021; never bridges a keep-mask gap per D-026) — both unit-tested. This does not change #6's acceptance; it's the consumer the baseline (#11-adjacent, and #7 via D-028) builds on.
+
 ---
 
 ### M2 — GO/NO-GO: Radar carries navigation signal
@@ -181,6 +184,8 @@ On our own frames, the go/no-go: check whether WASD is predictable from the rada
 **HONEST-GATE behaviour:** the probe prints its verdict as **PROVISIONAL** below a data-volume floor (`MIN_PROBE_FRAMES=20000`, `MIN_PROBE_SESSIONS=3`). A provisional PASS is a smoke test only and must NOT be recorded in DECISIONS.md as the M2 outcome — the committed verdict + threshold come from a re-run at full data volume (D-020). Rationale in DECISIONS **D-023**. A linear probe is a floor (a CNN could do better), so a committed "no signal" warrants one CNN attempt before the KILL flag; a committed clear positive is a real GO. Requires v3 sessions (the radar array); on v1/v2-only data the probe reports cleanly that it needs v3 data.
 
 **Remaining to close #7:** (1) after the v3 dataset reaches committed volume, run `--probe`, commit the M2 threshold + verdict in DECISIONS.md; (2) if no signal, attempt a CNN probe, then KILL-or-proceed. (Geometry/legibility is done.)
+
+**Stronger non-linear route now available (D-028):** the CNN attempt that D-023 reserves for a committed "no signal" no longer needs bespoke code — `python -m src.model_lstm --train --crop radar` trains the D-027 CNN+LSTM baseline on the radar feed and reports held-out WASD lift on the same whole-session split, directly comparable to the FPV run. So resolving #7 at volume is: run the linear `--probe` first (the floor); if flat, run the radar training as the non-linear attempt; commit the verdict from whichever clears the bar. Both remain subject to the D-023 volume floor — at ~15k frames either is a smoke test, not the committed gate.
 
 ---
 
