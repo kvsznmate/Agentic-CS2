@@ -92,6 +92,48 @@ _PER_FRAME_OPTIONAL = ["radar"]
 # loudly rather than loaded on a guess (DATA_FORMAT.md extension rule 1).
 _SUPPORTED_SCHEMA = {1, 2, 3}
 
+# Keep-mask sidecar (D-026): clean_session.py writes an OPTIONAL per-session mask
+# marking blank/no-radar frames (buy menu, halftime, dead/spectate) for exclusion.
+# It is a sidecar - the recordings are never modified - so this loader reads it
+# only when a caller opts in (use_keep_mask=True). Default OFF: the #7 radar gate
+# and the committed split must not silently change because a mask appeared on disk.
+_KEEP_MASK_FILE = "keep_mask.npz"
+
+
+def _keep_mask_path(session_path):
+    """Where a session's keep-mask sidecar lives (folder inside; v1 -> <stem>.mask/)."""
+    if os.path.isdir(session_path):
+        return os.path.join(session_path, _KEEP_MASK_FILE)
+    stem = session_path[:-4] if session_path.endswith(".npz") else session_path
+    return os.path.join(stem + ".mask", _KEEP_MASK_FILE)
+
+
+def load_keep_mask(session_path, expected_frames=None):
+    """Return a session's keep-mask boolean array, or None if absent/stale/invalid.
+
+    A keep-mask (D-026) is length-N bool, index-aligned to the session's
+    concatenated per-frame arrays: True = keep (gameplay), False = blank/no-radar.
+    If expected_frames is given and the mask was built for a different N (a STALE
+    mask, e.g. the session was re-recorded), it is ignored with a warning rather
+    than misaligning frames. Any read error -> None (mask is optional, never fatal).
+    """
+    mpath = _keep_mask_path(session_path)
+    if not os.path.isfile(mpath):
+        return None
+    try:
+        with np.load(mpath, allow_pickle=False) as d:
+            keep = d["keep"].astype(bool)
+            src_n = int(d["source_frames"]) if "source_frames" in d.files else keep.shape[0]
+    except (OSError, KeyError, ValueError) as e:
+        print(f"  (keep-mask for {session_name(session_path)} unreadable: "
+              f"{e.__class__.__name__} - ignoring)")
+        return None
+    if expected_frames is not None and src_n != expected_frames:
+        print(f"  (keep-mask for {session_name(session_path)} was built for {src_n} "
+              f"frames but session has {expected_frames} - stale, ignoring)")
+        return None
+    return keep
+
 # FPV model input geometry, from D-012 / DATA_FORMAT.md. (H, W).
 FRAME_H, FRAME_W = 150, 270
 
@@ -405,18 +447,40 @@ class SessionDataset:
     list, so it cannot leak through iteration.
     """
 
-    def __init__(self, session_paths, crop="full"):
+    def __init__(self, session_paths, crop="full", use_keep_mask=False):
         self.session_paths = list(session_paths)
         self.crop = crop
+        self.use_keep_mask = use_keep_mask
         self._input_kind, self._rect = _resolve_input(crop)
         self._cache = {}  # path -> arrays dict (lazy)
 
+        # The global index lists (session_i, local_i) for every SERVED frame. When
+        # use_keep_mask is on, blank/no-radar frames (D-026) are excluded HERE, so
+        # they never enter iteration, batching, or __len__ - the same structural
+        # exclusion the train/holdout split uses (a dropped frame is simply not in
+        # the index). Default off: with no mask, or use_keep_mask=False, every
+        # frame is indexed exactly as before.
         self._index = []            # list of (session_i, local_i)
-        self._session_lengths = []
+        self._session_lengths = []  # FULL length per session (before masking)
+        self._kept_per_session = []  # served (post-mask) length per session
+        n_masked_total = 0
         for si, path in enumerate(self.session_paths):
             n = self._session_length(path)
             self._session_lengths.append(n)
-            self._index.extend((si, li) for li in range(n))
+            keep = load_keep_mask(path, expected_frames=n) if use_keep_mask else None
+            if keep is None:
+                locals_iter = range(n)
+                self._kept_per_session.append(n)
+            else:
+                kept_locals = np.nonzero(keep)[0]
+                locals_iter = kept_locals.tolist()
+                self._kept_per_session.append(int(kept_locals.size))
+                n_masked_total += int(n - kept_locals.size)
+            self._index.extend((si, li) for li in locals_iter)
+        if use_keep_mask and n_masked_total:
+            print(f"  keep-mask: excluded {n_masked_total} blank/no-radar frame(s) "
+                  f"across {len(self.session_paths)} session(s); serving "
+                  f"{len(self._index)} frames.")
 
     @staticmethod
     def _session_length(path):
@@ -563,7 +627,7 @@ class SessionDataset:
 
 
 def build_datasets(rec_dir=_REC_DIR, crop="full", holdout_frac=DEFAULT_HOLDOUT_FRAC,
-                   manual_holdout=None):
+                   manual_holdout=None, use_keep_mask=False):
     """Construct (train_ds, holdout_ds) with the leak-free whole-session split.
 
     The entry point trainers should call. The two datasets are built from
@@ -577,8 +641,8 @@ def build_datasets(rec_dir=_REC_DIR, crop="full", holdout_frac=DEFAULT_HOLDOUT_F
     to an LRU or stream chunks — flagged here so it's a conscious change.
     """
     train_paths, holdout_paths = split_sessions(rec_dir, holdout_frac, manual_holdout)
-    train_ds = SessionDataset(train_paths, crop=crop)
-    holdout_ds = SessionDataset(holdout_paths, crop=crop)
+    train_ds = SessionDataset(train_paths, crop=crop, use_keep_mask=use_keep_mask)
+    holdout_ds = SessionDataset(holdout_paths, crop=crop, use_keep_mask=use_keep_mask)
     return train_ds, holdout_ds
 
 

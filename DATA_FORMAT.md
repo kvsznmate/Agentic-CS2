@@ -49,6 +49,8 @@ data/recordings/session_20260810_131408/
   chunk_00001.npz        # next chunk
   ...
   chunk_00042.npz.tmp.npz # (only if a crash happened mid-write; ignored by loaders)
+  keep_mask.npz          # (OPTIONAL sidecar, D-026) blank/no-radar frame mask
+  clean_report.json      # (OPTIONAL sidecar, D-026) human-readable mask summary
 ```
 
 - Each `chunk_NNNNN.npz` holds a contiguous slice of the session's frames in the
@@ -84,6 +86,44 @@ session interrupted by a crash is identifiable (its manifest says
 `complete: false`, or lists no chunks). Discovery excludes such sessions (D-022).
 The per-chunk `schema_version`/`geom`/`loop_fps_target` fields (below) are also
 written inside each chunk, so a chunk is self-describing in isolation.
+
+### keep_mask.npz — OPTIONAL dataset-hygiene sidecar (D-026)
+
+A session folder MAY contain a `keep_mask.npz` + `clean_report.json`, written by
+`python -m src.clean_session`. These are **sidecars**: they never alter the
+chunks, and a session is complete and fully usable without them. The mask marks
+**blank/no-radar** frames (buy menu, halftime, dead/spectate screen) — frames
+whose radar crop is near-uniform and whose actions are decoupled from map
+position — so training can exclude them.
+
+`keep_mask.npz` arrays:
+
+| Key | Shape | dtype | Meaning |
+|---|---|---|---|
+| `keep` | (N,) | bool | `True` = keep (gameplay), `False` = blank/no-radar. **Index-aligned to the session's concatenated per-frame arrays** — row `i` corresponds to frame `i` of `frames`/`radar`/`keys`/… (same alignment rule as every per-frame array). |
+| `variance` | (N,) | float32 | Per-frame radar grayscale variance the cut was applied to (stored so the threshold can be re-applied at a different value without recomputing). |
+| `threshold` | () | float32 | The variance cut used: `keep = variance > threshold`. |
+| `schema_version` | () | int | Mask format version (currently `1`), independent of the recording `schema_version`. |
+| `source_frames` | () | int | The `N` the mask was built for. A loader compares this to the session length and IGNORES a mask whose `source_frames` differs (a stale mask, e.g. after re-recording) rather than misaligning frames. |
+
+How the cut is chosen: `clean_session.py` pools per-frame radar variance across
+ALL sessions and finds the blank/present split by Otsu on the log-variance
+histogram (the same `_radar_variance` + `_gameplay_threshold` the #7 probe uses),
+deriving ONE threshold applied to every session. It refuses to write masks if the
+pooled distribution isn't clearly bimodal (unless `--force`).
+
+How the loader uses it: **opt-in only.** `build_datasets(use_keep_mask=True)` /
+`SessionDataset(use_keep_mask=True)` exclude `keep == False` frames by leaving
+them out of the global index (a dropped frame is simply never served — the same
+mechanism as the train/holdout split). The **default is off**: with
+`use_keep_mask=False` (or no mask present) every frame is served exactly as
+before, so the mask cannot silently change what the #7 gate or a trainer reads.
+
+Scope limit: the cut is on RADAR variance, so it only catches frames where the
+*radar* is blank. Junk with a normal radar (e.g. the buy menu open while the
+minimap still renders behind it) is NOT caught by this mask and needs a separate
+FPV-side signal. `python -m src.review_session` visualises the mask (dropped
+frames tinted) so this class of miss can be spotted by eye.
 
 ---
 

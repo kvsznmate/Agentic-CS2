@@ -125,7 +125,39 @@ You'll know it worked because the start of the line in the terminal will now sho
 ## Part 4 — First time only: a quick check that everything works
 
 Do this **once**, before your very first real recording, to make sure the mouse
-and screen are being read correctly.
+and screen are being read correctly. There are two small checks. Do the
+live-readout check first (it's the quickest way to *see* that your inputs are
+registering), then the alignment check.
+
+### 4a. See your inputs registering live (dry run — saves nothing)
+
+This runs the recorder in a "watch only" mode: it reads your screen, keys, and
+mouse in real time and prints what it sees, but **saves nothing to disk**. It's
+just so you can watch the numbers move and confirm everything is being picked up.
+
+Type this and press **Enter**:
+
+```
+python -m src.recorder --dryrun
+```
+
+Now click into CS2 and **move around, press W A S D, and move the mouse**. Back in
+the terminal you'll see a line updating live — the keys you're holding, whether
+you're clicking (`L`/`R`), and how far the mouse moved (`dx`/`dy`). Watch it for a
+few seconds:
+
+- Press **W** → `w` should appear in the held-keys list. Same for A, S, D.
+- Move the mouse **right** → `dx` goes **positive**; **left** → `dx` goes
+  **negative**.
+- Click → `L=1` while the left button is down.
+
+If the numbers move when you do things, everything is being read. Press **`F8`**
+to stop. (It also stops on its own after about 20 seconds.)
+
+> **If nothing changes** when you press keys or move the mouse — the values stay
+> at zero — stop and tell the developer. Don't go on to record.
+
+### 4b. Check the timing lines up (alignment check)
 
 Type this and press **Enter**:
 
@@ -235,6 +267,68 @@ cleanly). You can ignore it.
 
 ---
 
+## Part 8 — Check a recording actually worked (optional but recommended)
+
+After a recording — especially your first few — it's worth a quick look to
+confirm it really captured your game and your inputs, rather than, say, a black
+screen. There's a tool that does this for you.
+
+To check your **most recent** recording, type this and press **Enter**:
+
+```
+python -m src.recorder --inspect
+```
+
+It prints a summary: how many frames were captured, the real frame rate, which
+keys you pressed and how often, how much the mouse moved, and whether everything
+is lined up in time (`ALIGNED`). Skim it for these:
+
+- **`ALIGNED`** near the top — good. If it says `MISALIGNED`, tell the developer.
+- **Key activity** — the keys you actually used (W, A, S, D…) should show up with
+  sensible percentages. If it says "no keys held," something didn't record.
+- **Mouse deltas** — should show a range of movement, not all zeros. A warning
+  that "all dx are zero" means your aim wasn't captured — tell the developer.
+- Any line starting with **`WARNING`** — note it and mention it to the developer.
+
+To actually **see** a few of the captured screens as images (saved as PNGs you
+can open), add a number:
+
+```
+python -m src.recorder --inspect --dump 6
+```
+
+That saves 6 pictures from the recording into `data\capture_debug\` so you can
+open them and confirm they show the game. To also see the saved minimap close-ups,
+use `--dump-radar 6` the same way.
+
+> You don't have to do this after every single recording once you trust your
+> setup — but do it after the first few, and any time something felt off.
+
+---
+
+## For the developer — extra diagnostic commands
+
+*(This section is for the developer, not the recording operator. The output is
+technical. Skip it if you're just here to record.)*
+
+- **`python -m src.recorder --profile`** — runs the loop unpaced and times each
+  stage (mouse read, key read, grab + radar crop, record assembly) to show what
+  limits the recording FPS. Play normally while it runs; F8 to stop. Confirms
+  whether the mss grab dominates (expected) or another stage is unexpectedly
+  heavy.
+- **`python -m src.inspect_recording <name-or-path>`** — the full inspector that
+  `--inspect` calls; run it directly against any specific session folder or a
+  legacy `.npz` (e.g. `python -m src.inspect_recording data\recordings\session_20260811_141839`).
+  Supports `--dump N` and `--dump-radar N`.
+- **`python -m src.recorder --record-single`** — legacy single-file **v1**
+  writer (FPV only, **no radar**). Kept only as a self-contained round-trip smoke
+  test; **do not** use it to build the radar (#7) dataset — use `--record`, which
+  writes the v3 FPV+radar folder.
+- **`python -m src.raw_mouse --selftest`** — checks raw mouse deltas are being
+  read at all (run with CS2 focused); the first thing to try if `--verify` fails.
+
+---
+
 ## Quick recap (once you've done it once)
 
 Every time you want to record:
@@ -247,6 +341,7 @@ Every time you want to record:
 6. Click into CS2 and **play**.
 7. Press **`F8`** to stop and save.
 8. Recordings appear in `data\recordings\`.
+9. *(Optional)* `python -m src.recorder --inspect` to confirm it captured cleanly.
 
 ---
 
@@ -256,7 +351,11 @@ Every time you want to record:
   `conda activate agentic-cs2` and press Enter.
 - **"No such file or directory" or the command isn't found** → you're probably
   not in the project folder; redo Part 2 (the `cd …` line).
-- **The alignment check (Part 4) says FAIL** → don't record; tell the developer.
+- **The live readout (Part 4a) doesn't change** when you press keys / move the
+  mouse → don't record; tell the developer.
+- **The alignment check (Part 4b) says FAIL** → don't record; tell the developer.
+- **`--inspect` (Part 8) says `MISALIGNED`, "no keys held," or "all dx are
+  zero"** → that recording didn't capture properly; tell the developer.
 - **It refuses to start because the disk is full** → free up space, or ask the
   developer.
 - **1920 × 1080 isn't available, or your screen recommends a different

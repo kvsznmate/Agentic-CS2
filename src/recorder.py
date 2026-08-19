@@ -809,10 +809,17 @@ def _build_parser():
                    help="run the loop with a live readout, save nothing")
     g.add_argument("--profile", action="store_true",
                    help="time each loop stage to find what limits FPS (saves nothing)")
+    g.add_argument("--inspect", action="store_true",
+                   help="summarise a recording (newest by default) — thin wrapper "
+                        "around src.inspect_recording for the operator's convenience")
     p.add_argument("--seconds", type=float, default=None,
                    help="duration; defaults per mode. Omit with --record to run until F8.")
     p.add_argument("--name", type=str, default=None,
                    help="optional recording name stub")
+    p.add_argument("--dump", type=int, default=0, metavar="N",
+                   help="with --inspect: also save N FPV frames as PNG")
+    p.add_argument("--dump-radar", type=int, default=0, metavar="N",
+                   help="with --inspect: also save N radar crops as PNG (v3)")
     return p
 
 
@@ -828,9 +835,16 @@ def main(argv=None):
         dryrun(seconds=args.seconds or 20.0)
     elif args.profile:
         profile(seconds=args.seconds or 20.0)
+    elif args.inspect:
+        # Convenience passthrough so the operator has ONE tool (the recorder) for
+        # record + check, per HOW_TO_RECORD Part 8. Resolves the target (newest
+        # recording if --name omitted) and defers to the real inspector.
+        from src import inspect_recording as _insp
+        target = _insp._resolve_target(args.name)
+        _insp.inspect(target, dump=args.dump, dump_radar=args.dump_radar)
     else:
         print("Choose a mode: --verify (do first), --record (extended v3), "
-              "--dryrun, or --profile.")
+              "--dryrun, --profile, or --inspect.")
         print("See `python -m src.recorder -h`.")
 
 
