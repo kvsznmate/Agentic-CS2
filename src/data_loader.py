@@ -82,15 +82,20 @@ from src import capture_config as cfg
 _REC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "recordings")
 
 # Per-frame arrays that must stay index-aligned (must match DATA_FORMAT.md).
-# `radar` is present only in v3 sessions (D-024); it is handled as an OPTIONAL
-# per-frame array (see _PER_FRAME_OPTIONAL) so v1/v2 still load.
+# `radar` is present only in v3+ sessions (D-024); `alive`/`round_phase` only in
+# v4+ (D-031); `health`/`active_weapon`/`ammo_clip`/`ammo_reserve` only in v5+
+# (D-033). All are handled as OPTIONAL per-frame arrays (see _PER_FRAME_OPTIONAL)
+# so older sessions still load.
 _PER_FRAME = ["frames", "timestamps", "keys", "lclick", "rclick", "dx", "dy"]
-_PER_FRAME_OPTIONAL = ["radar"]
+_PER_FRAME_OPTIONAL = ["radar", "alive", "round_phase",
+                      "health", "active_weapon", "ammo_clip", "ammo_reserve"]
 
 # Schema versions this loader understands. 1 = legacy single file, 2 = chunked
-# FPV-only, 3 = chunked FPV + high-res radar (D-024). Anything else is refused
-# loudly rather than loaded on a guess (DATA_FORMAT.md extension rule 1).
-_SUPPORTED_SCHEMA = {1, 2, 3}
+# FPV-only, 3 = chunked FPV + high-res radar (D-024), 4 = + per-frame GSI
+# alive/round_phase (D-031), 5 = + per-frame GSI state features health/weapon/ammo
+# (D-033). Anything else is refused loudly rather than loaded on a guess
+# (DATA_FORMAT.md extension rule 1).
+_SUPPORTED_SCHEMA = {1, 2, 3, 4, 5}
 
 # Keep-mask sidecar (D-026): clean_session.py writes an OPTIONAL per-session mask
 # marking blank/no-radar frames (buy menu, halftime, dead/spectate) for exclusion.
@@ -133,6 +138,64 @@ def load_keep_mask(session_path, expected_frames=None):
               f"frames but session has {expected_frames} - stale, ignoring)")
         return None
     return keep
+
+
+def load_alive_mask(session_path):
+    """Return a session's per-frame gameplay-keep bool from its stored `alive`
+    array (v4, D-031), or None if the session has no `alive` field (v1/v2/v3).
+
+    This is the AUTHORITATIVE gameplay filter (issue #21): `alive[i] == 1` means
+    the GSI own-POV alive rule held at frame i (alive AND not spectating), so the
+    frame is real first-person gameplay. It is the counterpart to load_keep_mask
+    (D-026's radar-variance heuristic) but sourced from an engine-ground-truth
+    flag instead of a pixel heuristic, and needs no sidecar (the flag is in the
+    recording). Returns a length-N bool array (True = keep), index-aligned to the
+    session's concatenated per-frame arrays like every other per-frame array.
+
+    Unlike the keep-mask there is no staleness/`source_frames` check: `alive` is
+    stored IN the session, so it is always the right length by construction (the
+    load-time alignment assertion in load_session_arrays already guarantees it).
+    """
+    arrays = load_session_arrays(session_path)
+    if "alive" not in arrays:
+        return None
+    return arrays["alive"].astype(bool)
+
+
+# State-feature columns (D-033, v5), in a fixed order. `active_weapon` is a string
+# and is returned separately from the numeric matrix (it can't share a float
+# array); the combat model (#12) will map weapon names to its own encoding.
+STATE_NUMERIC_COLS = ["health", "ammo_clip", "ammo_reserve"]
+
+
+def load_state_features(session_path):
+    """Return per-frame GSI STATE FEATURES for a v5 session, or None if absent.
+
+    These are the model-INPUT features added in v5 (D-033): own-player state the
+    combat sub-policy (#12) can condition on. Returns a dict:
+        {"numeric": float32 (N, 3) over STATE_NUMERIC_COLS  [health, ammo_clip,
+                    ammo_reserve], with the on-disk sentinels preserved
+                    (health 0 = dead/absent, ammo -1 = no-ammo-concept/unknown);
+         "active_weapon": (N,) array of weapon-name strings (sentinel "" = none);
+         "cols": STATE_NUMERIC_COLS}
+    or None if this session predates v5 (no `health` field).
+
+    Deliberately NOT folded into get_batch's Y (which is the ACTION vector). State
+    features are inputs, not labels; a consumer that wants them (the future combat
+    model) reads them here and decides its own normalization/encoding — e.g.
+    scaling health to [0,1], one-hotting the weapon, treating the -1 ammo sentinel
+    as its own bin. No current model uses this (D-027 movement baseline is
+    unchanged); it exists so v5 data is usable when #12 is built.
+    """
+    arrays = load_session_arrays(session_path)
+    if "health" not in arrays:
+        return None
+    numeric = np.stack(
+        [arrays[c].astype(np.float32) for c in STATE_NUMERIC_COLS], axis=1)
+    weapon = arrays["active_weapon"] if "active_weapon" in arrays else \
+        np.array([""] * numeric.shape[0])
+    return {"numeric": numeric, "active_weapon": weapon, "cols": list(STATE_NUMERIC_COLS)}
+
 
 # FPV model input geometry, from D-012 / DATA_FORMAT.md. (H, W).
 FRAME_H, FRAME_W = 150, 270
@@ -447,40 +510,75 @@ class SessionDataset:
     list, so it cannot leak through iteration.
     """
 
-    def __init__(self, session_paths, crop="full", use_keep_mask=False):
+    def __init__(self, session_paths, crop="full", use_keep_mask=False,
+                 use_gameplay_filter=False):
         self.session_paths = list(session_paths)
         self.crop = crop
         self.use_keep_mask = use_keep_mask
+        self.use_gameplay_filter = use_gameplay_filter
         self._input_kind, self._rect = _resolve_input(crop)
         self._cache = {}  # path -> arrays dict (lazy)
 
-        # The global index lists (session_i, local_i) for every SERVED frame. When
-        # use_keep_mask is on, blank/no-radar frames (D-026) are excluded HERE, so
-        # they never enter iteration, batching, or __len__ - the same structural
+        # The global index lists (session_i, local_i) for every SERVED frame.
+        # Frames can be excluded HERE by either optional filter, so excluded
+        # frames never enter iteration, batching, or __len__ - the same structural
         # exclusion the train/holdout split uses (a dropped frame is simply not in
-        # the index). Default off: with no mask, or use_keep_mask=False, every
-        # frame is indexed exactly as before.
+        # the index). Both default OFF: with neither filter, every frame is
+        # indexed exactly as before, so the #7 gate and the committed split do not
+        # move because a filter became available.
+        #   * use_gameplay_filter (D-031): keep frames where the stored GSI `alive`
+        #     flag is 1 (own-POV alive, not spectating). Authoritative; v4 only.
+        #   * use_keep_mask (D-026): keep frames the radar-variance sidecar marks
+        #     as non-blank. Heuristic; secondary hygiene.
+        # When both are on, a frame must pass BOTH (logical AND) to be served -
+        # the authoritative alive flag and the blank-radar heuristic are
+        # complementary (alive catches menu/dead/spectate; variance catches blank
+        # radar the flag might miss). A session lacking a given signal (older
+        # format, or no sidecar) simply isn't filtered by that one.
         self._index = []            # list of (session_i, local_i)
         self._session_lengths = []  # FULL length per session (before masking)
         self._kept_per_session = []  # served (post-mask) length per session
-        n_masked_total = 0
+        n_masked_keep = 0           # excluded by the radar-variance keep-mask
+        n_masked_alive = 0          # excluded by the GSI alive gameplay filter
         for si, path in enumerate(self.session_paths):
             n = self._session_length(path)
             self._session_lengths.append(n)
-            keep = load_keep_mask(path, expected_frames=n) if use_keep_mask else None
-            if keep is None:
-                locals_iter = range(n)
-                self._kept_per_session.append(n)
-            else:
-                kept_locals = np.nonzero(keep)[0]
-                locals_iter = kept_locals.tolist()
-                self._kept_per_session.append(int(kept_locals.size))
-                n_masked_total += int(n - kept_locals.size)
-            self._index.extend((si, li) for li in locals_iter)
-        if use_keep_mask and n_masked_total:
-            print(f"  keep-mask: excluded {n_masked_total} blank/no-radar frame(s) "
-                  f"across {len(self.session_paths)} session(s); serving "
-                  f"{len(self._index)} frames.")
+
+            # Start with "keep everything", then AND in whichever filters apply.
+            keep_combined = np.ones(n, dtype=bool)
+
+            if use_gameplay_filter:
+                alive = load_alive_mask(path)
+                if alive is not None:
+                    if alive.shape[0] != n:
+                        raise ValueError(
+                            f"{session_name(path)}: stored alive array length "
+                            f"{alive.shape[0]} != session length {n} - refusing "
+                            f"to misalign the gameplay filter.")
+                    n_masked_alive += int(n - int(alive.sum()))
+                    keep_combined &= alive
+                # alive is None on v1/v2/v3 (no field): that session is simply not
+                # gameplay-filtered (can't be), rather than dropped wholesale.
+
+            if use_keep_mask:
+                keep = load_keep_mask(path, expected_frames=n)
+                if keep is not None:
+                    n_masked_keep += int(n - int(keep.sum()))
+                    keep_combined &= keep
+
+            kept_locals = np.nonzero(keep_combined)[0]
+            self._kept_per_session.append(int(kept_locals.size))
+            self._index.extend((si, int(li)) for li in kept_locals)
+
+        if use_gameplay_filter and n_masked_alive:
+            print(f"  gameplay filter (GSI alive, D-031): excluded {n_masked_alive} "
+                  f"non-gameplay frame(s) across {len(self.session_paths)} "
+                  f"session(s).")
+        if use_keep_mask and n_masked_keep:
+            print(f"  keep-mask (radar variance, D-026): excluded {n_masked_keep} "
+                  f"blank/no-radar frame(s).")
+        if (use_gameplay_filter or use_keep_mask) and (n_masked_alive or n_masked_keep):
+            print(f"  serving {len(self._index)} frames after filtering.")
 
     @staticmethod
     def _session_length(path):
@@ -627,7 +725,8 @@ class SessionDataset:
 
 
 def build_datasets(rec_dir=_REC_DIR, crop="full", holdout_frac=DEFAULT_HOLDOUT_FRAC,
-                   manual_holdout=None, use_keep_mask=False):
+                   manual_holdout=None, use_keep_mask=False,
+                   use_gameplay_filter=False):
     """Construct (train_ds, holdout_ds) with the leak-free whole-session split.
 
     The entry point trainers should call. The two datasets are built from
@@ -635,14 +734,25 @@ def build_datasets(rec_dir=_REC_DIR, crop="full", holdout_frac=DEFAULT_HOLDOUT_F
     absent from the training dataset — enforced structurally, not by a flag
     someone can forget. Crashed/empty sessions are excluded upstream (D-022).
 
+    Filtering (both default OFF, both applied identically to train and held-out
+    so the split's meaning is unchanged):
+      * use_gameplay_filter (D-031): serve only frames whose stored GSI `alive`
+        flag is set — authoritative alive/gameplay filtering (issue #21). v4 only;
+        older sessions are unaffected.
+      * use_keep_mask (D-026): also exclude blank/no-radar frames per the
+        variance sidecar. Combined with the above via AND (see SessionDataset).
+
     Memory note: SessionDataset caches decompressed frames per session on access.
     With the v3 radar array each cached session is a bit larger (+128x128x3/frame,
-    D-024). Fine at the current scale; for a much larger corpus switch the cache
-    to an LRU or stream chunks — flagged here so it's a conscious change.
+    D-024); v4 adds only the tiny alive/round_phase arrays. Fine at the current
+    scale; for a much larger corpus switch the cache to an LRU or stream chunks —
+    flagged here so it's a conscious change.
     """
     train_paths, holdout_paths = split_sessions(rec_dir, holdout_frac, manual_holdout)
-    train_ds = SessionDataset(train_paths, crop=crop, use_keep_mask=use_keep_mask)
-    holdout_ds = SessionDataset(holdout_paths, crop=crop, use_keep_mask=use_keep_mask)
+    train_ds = SessionDataset(train_paths, crop=crop, use_keep_mask=use_keep_mask,
+                              use_gameplay_filter=use_gameplay_filter)
+    holdout_ds = SessionDataset(holdout_paths, crop=crop, use_keep_mask=use_keep_mask,
+                                use_gameplay_filter=use_gameplay_filter)
     return train_ds, holdout_ds
 
 
@@ -659,6 +769,9 @@ def _summarise(argv=None):
     p.add_argument("--holdout-frac", type=float, default=DEFAULT_HOLDOUT_FRAC,
                    help=f"held-out fraction for the hash split (default {DEFAULT_HOLDOUT_FRAC})")
     p.add_argument("--batch", type=int, default=8, help="sanity-check batch size")
+    p.add_argument("--gameplay-filter", action="store_true",
+                   help="serve only GSI-alive gameplay frames (v4, D-031); reports "
+                        "how many frames each session keeps")
     args = p.parse_args(argv)
 
     sessions = discover_sessions(report=True)
@@ -688,8 +801,11 @@ def _summarise(argv=None):
         return
 
     try:
-        train_ds, holdout_ds = build_datasets(crop=args.crop, holdout_frac=args.holdout_frac)
-        print(f"Input '{args.crop}': train {len(train_ds)} frames across "
+        train_ds, holdout_ds = build_datasets(
+            crop=args.crop, holdout_frac=args.holdout_frac,
+            use_gameplay_filter=args.gameplay_filter)
+        filt = " (GSI-alive gameplay only)" if args.gameplay_filter else ""
+        print(f"Input '{args.crop}'{filt}: train {len(train_ds)} frames across "
               f"{train_ds.n_sessions} session(s); held-out {len(holdout_ds)} frames "
               f"across {holdout_ds.n_sessions} session(s).")
         # Prefer a TRAIN batch; if TRAIN can't serve this input (e.g. radar but

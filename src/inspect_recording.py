@@ -1,13 +1,19 @@
 """inspect_recording.py — summarise and spot-check a recording.
 
 A reusable tool for looking inside recordings produced by `recorder.py`. Reads
-all formats: a **v3 session folder** (manifest.json + chunk_*.npz WITH a per-frame
+all formats: a **v4 session folder** (v3 + per-frame GSI `alive`/`round_phase`,
+D-031), a **v3 session folder** (manifest.json + chunk_*.npz WITH a per-frame
 `radar` array, D-024), a **v2 session folder** (FPV-only chunks, D-018), and a
 legacy **v1 single .npz**. Use it to confirm a session is well-formed and
 actually captured gameplay before trusting it: array shapes + alignment (incl.
-the radar array on v3), key/click activity, mouse-delta ranges, real frame rate
-from timestamps, and (optionally) a few frames dumped to PNG so you can SEE the
-images are real.
+the radar array on v3+), the GSI alive/round_phase summary on v4, key/click
+activity, mouse-delta ranges, real frame rate from timestamps, and (optionally)
+a few frames dumped to PNG so you can SEE the images are real.
+
+Note: `alive`/`round_phase` (v4) are NOT added to the alignment set below on
+purpose — the alignment check runs over `_PER_FRAME` and older tools/sessions
+lack them; they are summarised separately and their length is implicitly checked
+by the loader, which is authoritative.
 
 Why both numbers and images: matching array shapes prove the record is
 structurally sound (frames and actions index-aligned), but only eyeballing a
@@ -98,6 +104,10 @@ def _kind_from_schema(schema_version, is_folder):
         return "v2 session folder (FPV only)"
     if v == 3:
         return "v3 session folder (FPV + radar)"
+    if v == 4:
+        return "v4 session folder (FPV + radar + GSI alive)"
+    if v == 5:
+        return "v5 session folder (FPV + radar + GSI alive + state features)"
     return f"schema-v{v} {'folder' if is_folder else 'file'} (newer than this tool knows)"
 
 
@@ -221,6 +231,77 @@ def inspect(target, dump=0, dump_radar=0):
         if sample.max() - sample.min() < 5:
             print("  WARNING: almost no pixel variation — capture may have been "
                   "black/stuck. Dump frames (--dump) and look.")
+        print()
+
+    # ── GSI alive / round_phase sanity (v4, D-031) ──
+    if "alive" in d:
+        alive = d["alive"].astype(bool)
+        n_alive = int(alive.sum())
+        tot = alive.shape[0]
+        print(f"GSI alive (v4, D-031): {n_alive}/{tot} frames alive "
+              f"({100*n_alive/max(tot,1):.1f}%), {tot - n_alive} dead/spectating/menu.")
+        # Count alive/dead transitions as a coarse sanity signal (a real session
+        # should show at least one death if you died; all-alive or all-dead is a
+        # flag worth an eyeball).
+        if tot > 1:
+            flips = int(np.count_nonzero(np.diff(alive.astype(np.int8))))
+            print(f"  alive<->dead transitions: {flips}")
+        if n_alive == 0:
+            print("  WARNING: NO alive frames — GSI may not have tracked life, or "
+                  "the whole session was dead/spectate/menu. Verify with "
+                  "`--verify-gsi` before trusting the gameplay filter.")
+        elif n_alive == tot:
+            print("  NOTE: every frame is alive — fine if you never died, but if you "
+                  "did, check the spectating guard with `--verify-gsi`.")
+        if "round_phase" in d:
+            rp = d["round_phase"]
+            vals, counts = np.unique(rp.astype(str), return_counts=True)
+            dist = ", ".join(f"{v!r}:{int(c)}" for v, c in zip(vals, counts))
+            print(f"  round_phase distribution: {dist}")
+        print()
+
+    # ── GSI state features sanity (v5, D-033) ──
+    if "health" in d:
+        health = d["health"]
+        tot = health.shape[0]
+        # Health over frames the session considers gameplay (alive), if we have it,
+        # else over all frames. Sentinel 0 doubles as dead; the alive flag
+        # disambiguates, so summarise health on alive frames for a meaningful range.
+        if "alive" in d:
+            am = d["alive"].astype(bool)
+            hp_live = health[am]
+            scope = f"{hp_live.shape[0]} alive frames"
+        else:
+            hp_live = health
+            scope = f"{tot} frames"
+        if hp_live.size:
+            print(f"GSI state features (v5, D-033):")
+            print(f"  health over {scope}: min={int(hp_live.min())} "
+                  f"max={int(hp_live.max())} mean={hp_live.mean():.1f}")
+        else:
+            print(f"GSI state features (v5, D-033): no alive frames to summarise "
+                  f"health over.")
+        if "active_weapon" in d:
+            wv, wc = np.unique(d["active_weapon"].astype(str), return_counts=True)
+            # Show the most common few, so a full inventory doesn't flood output.
+            order = np.argsort(wc)[::-1]
+            top = ", ".join(f"{wv[i]!r}:{int(wc[i])}" for i in order[:8])
+            print(f"  active_weapon (top): {top}")
+            if (d["active_weapon"].astype(str) == "").all():
+                print("  WARNING: active_weapon is empty on every frame — GSI weapon "
+                      "block may not be arriving. Check the .cfg subscribes "
+                      "player_weapons.")
+        if "ammo_clip" in d and "ammo_reserve" in d:
+            clip = d["ammo_clip"]; res = d["ammo_reserve"]
+            has_ammo = clip >= 0  # sentinel -1 = no-ammo weapon (knife/C4)/unknown
+            n_has = int(has_ammo.sum())
+            if n_has:
+                print(f"  ammo (over {n_has} frames with an ammo weapon): "
+                      f"clip [{int(clip[has_ammo].min())},{int(clip[has_ammo].max())}], "
+                      f"reserve [{int(res[has_ammo].min())},{int(res[has_ammo].max())}]")
+            else:
+                print("  ammo: no frames with an ammo-bearing weapon (all "
+                      "knife/C4/none, or ammo not reported).")
         print()
 
     # ── Radar sanity (v3) ──

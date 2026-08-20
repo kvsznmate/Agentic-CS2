@@ -27,12 +27,28 @@ DECISIONS honoured:
   D-024  two-resolution capture: the extended recorder stores a separate high-res
          radar crop (128x128) alongside the 150x270 FPV, both from ONE grab
          (Capture.grab_with_radar). Format bumped to v3. See DATA_FORMAT.md.
-  single synchronous loop, per the way-one decision.
+  D-031  GSI alive/gameplay state folded into recording. A background GSI listener
+         (gsi_listener.GsiListener, the raw_mouse-style isolated-thread pattern)
+         is sampled ONCE per frame into a per-frame `alive` (bool) + `round_phase`
+         (str) field. Format bumped v3 -> v4. The alive RULE is own-POV health>0
+         (spectating a living teammate reads DEAD, not alive). Recording does not
+         START until GSI's first POST (a liveness gate: no silent zero-frame
+         sessions), and there is no forward-fill hole at the top because there are
+         no pre-contact frames. See DATA_FORMAT.md and DECISIONS D-030/D-031.
+  D-033  GSI STATE FEATURES added to recording (v4 -> v5): per-frame health,
+         active weapon, and clip/reserve ammo, sampled from the same GSI stream.
+         These are model INPUTS (state to condition on), NOT action labels, for
+         the future combat sub-policy (#12); no current model reads them. See
+         DATA_FORMAT.md and DECISIONS D-033.
+  single synchronous loop, per the way-one decision. The GSI listener is I/O on
+  its own thread (like the D-019 chunk writer); the capture loop only SAMPLES its
+  latest-value slot, so the frame/input sync path stays fully synchronous.
 
 Entry points:
-  python -m src.recorder --verify     # scripted-motion alignment check (DO FIRST)
-  python -m src.recorder --record     # record an extended chunked session (v3)
-  python -m src.recorder --dryrun     # loop + live readout, write nothing
+  python -m src.recorder --verify      # scripted-motion alignment check (DO FIRST)
+  python -m src.recorder --verify-gsi  # confirm GSI reaches the recorder + alive rule
+  python -m src.recorder --record      # record an extended chunked session (v5)
+  python -m src.recorder --dryrun      # loop + live readout, write nothing
 """
 
 import argparse
@@ -49,15 +65,46 @@ import win32api
 from src.capture import Capture
 from src import capture_config as cfg
 from src.raw_mouse import RawMouseListener
+from src.gsi_listener import GsiListener
 
 
 # Output location for recordings. data/ is gitignored (recordings are large and
 # local — see .gitignore and PROJECT_ISSUES #4/#5).
 _REC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "recordings")
 
-# On-disk schema version this recorder writes (DATA_FORMAT.md). v3 adds the
-# per-frame `radar` array (D-024) to the v2 chunked format.
-SCHEMA_VERSION = 3
+# On-disk schema version this recorder writes (DATA_FORMAT.md). v3 added the
+# per-frame `radar` array (D-024); v4 added the per-frame GSI `alive` +
+# `round_phase` fields (D-031); v5 adds per-frame GSI STATE FEATURES (health,
+# active weapon, ammo) as model INPUTS for the future combat sub-policy (D-033).
+SCHEMA_VERSION = 5
+
+# ── GSI alive/gameplay fields (D-031) ──────────────────────────────────────
+# The recorder samples the shared GSI listener once per frame and writes an
+# authoritative alive flag + coarse round phase per frame, so non-gameplay frames
+# (dead, spectating, menu) can be filtered out downstream (issue #21). See the
+# module docstring and DECISIONS D-030/D-031 for the alive rule and the
+# liveness-gate / no-pre-contact-frames design.
+#
+# `round_phase` is stored as a fixed-width string array; a sentinel marks "GSI
+# reported no phase" so the column is always the same dtype/width on disk.
+ROUND_PHASE_NONE = "?"          # sentinel: GSI update carried no round.phase
+ROUND_PHASE_MAXLEN = 16        # fixed width for the round_phase string column
+
+# ── GSI STATE FEATURES (D-033, v5) ──
+# Per-frame own-player STATE the model can CONDITION ON (inputs, NOT action
+# labels): current health, the active weapon name, and its clip/reserve ammo.
+# These feed the future combat sub-policy (#12) — e.g. "clip empty -> human
+# reloads", "low HP -> plays back". Captured now because they are free from the
+# GSI stream we already sample and can only be recorded live; NO current model
+# reads them (the D-027 movement baseline is unchanged). See D-033.
+#
+# Sentinels matter: health/ammo of 0 are REAL, meaningful states (dead / empty
+# clip), so "absent" must be a distinct value, never 0.
+WEAPON_NONE = ""              # sentinel: no active weapon known (menu/pre-GSI)
+WEAPON_MAXLEN = 24           # fixed width for the active_weapon string column
+AMMO_NONE = -1               # sentinel: weapon has no ammo concept (knife/C4) or unknown
+HEALTH_NONE = 0              # health when GSI has no local state; the dead value too,
+#                             disambiguated by the `alive` flag (False there)
 
 # Target loop rate. Profiling (D-016) showed the loop is entirely bounded by the
 # ~37 ms mss grab; input logging is free. Realised recording rate is ~15 FPS, so
@@ -124,20 +171,121 @@ def _read_clicks():
 
 
 class Recorder:
-    """Owns the capture, the mouse listener, and the per-frame record assembly."""
+    """Owns the capture, the mouse listener, the GSI listener, and per-frame
+    record assembly.
 
-    def __init__(self):
+    `use_gsi` controls whether a GSI listener is started and sampled. It is on for
+    the v4 recording path (record_session) and off for the FPV-only paths that
+    don't need an alive flag (the legacy single-file writer, dryrun, profile,
+    verify) — those keep working exactly as before with no GSI dependency.
+    """
+
+    def __init__(self, use_gsi=False, gsi_host=None, gsi_port=None, gsi_token=None):
         self.cap = Capture()
         self.mouse = RawMouseListener()
+        self.use_gsi = use_gsi
+        # Build the listener but don't start it until __enter__. Defaults come
+        # from gsi_listener (which matches the .cfg) when not overridden.
+        self.gsi = None
+        if use_gsi:
+            kw = {}
+            if gsi_host is not None:
+                kw["host"] = gsi_host
+            if gsi_port is not None:
+                kw["port"] = gsi_port
+            if gsi_token is not None:
+                kw["token"] = gsi_token
+            self.gsi = GsiListener(**kw)
 
     def __enter__(self):
         self.cap.__enter__()
         self.mouse.start()
+        if self.gsi is not None:
+            self.gsi.start()
         return self
 
     def __exit__(self, *exc):
+        if self.gsi is not None:
+            self.gsi.stop()
         self.mouse.stop()
         self.cap.__exit__(*exc)
+
+    def _sample_gsi(self):
+        """Sample the GSI slot once -> dict of per-frame GSI fields.
+
+        This is the per-frame, non-blocking read of the listener's latest-value
+        slot (the whole point of the isolated-thread design). Returns a dict with:
+          alive (bool), round_phase (str)            — gameplay filter (D-031)
+          health (int), active_weapon (str),
+          ammo_clip (int), ammo_reserve (int)        — state features (D-033, v5)
+
+        Applies the alive RULE and the staleness/first-contact conventions
+        (D-031/D-032):
+          * If GSI is off or has never POSTed -> all sentinels (alive False,
+            phase/weapon sentinels, health/ammo sentinels). record_session never
+            actually records pre-contact frames (it waits for first contact before
+            starting), so this pre-contact branch is a safety default, not a
+            normal path.
+          * Otherwise use the listener's parsed `alive` (own-POV steamid match AND
+            health>0; spectating a living teammate is already False here, computed
+            in gsi_listener.extract_state per D-032). A parsed alive of None (no
+            local health) is treated as False.
+          * round_phase is the coarse freezetime/live/over string, or sentinel.
+
+        STATE FEATURES (D-033) are model INPUTS, not action labels: health (0-100),
+        the active weapon name, and its clip/reserve ammo. Sentinels are used so
+        that a real 0 (dead, or empty clip) is never confused with "absent":
+        health -> HEALTH_NONE only when GSI has no local state; weapon ->
+        WEAPON_NONE when unknown; ammo -> AMMO_NONE for weapons with no ammo
+        concept (knife/C4) or when unknown. These are forward-filled between GSI
+        updates exactly like alive (the slot holds the last state).
+
+        NOTE on staleness: per D-031 a forward-filled value is carried as-is with
+        NO 'unknown' state and NO age field on disk — once GSI has spoken, the last
+        value stands until the next update. The known limitation (a crashed/quiet
+        GSI keeps writing its last value) is recorded in D-031; the startup
+        liveness gate plus review_session.py are the backstops, and the D-026
+        keep-mask remains a secondary hygiene layer.
+        """
+        blank = {
+            "alive": False,
+            "round_phase": ROUND_PHASE_NONE,
+            "health": HEALTH_NONE,
+            "active_weapon": WEAPON_NONE,
+            "ammo_clip": AMMO_NONE,
+            "ammo_reserve": AMMO_NONE,
+        }
+        if self.gsi is None:
+            return blank
+        state, _age = self.gsi.read_latest()
+        if state is None:
+            return blank
+
+        alive = bool(state.get("alive")) if state.get("alive") is not None else False
+        phase = state.get("round_phase") or ROUND_PHASE_NONE
+        if len(phase) > ROUND_PHASE_MAXLEN:
+            phase = phase[:ROUND_PHASE_MAXLEN]
+
+        # State features (D-033). health None -> sentinel; ammo None (knife/C4 or
+        # unknown) -> sentinel; weapon None -> sentinel. A real 0 is preserved.
+        hp = state.get("health")
+        health = int(hp) if hp is not None else HEALTH_NONE
+        weapon = state.get("active_weapon") or WEAPON_NONE
+        if len(weapon) > WEAPON_MAXLEN:
+            weapon = weapon[:WEAPON_MAXLEN]
+        clip = state.get("ammo_clip")
+        reserve = state.get("ammo_reserve")
+        ammo_clip = int(clip) if clip is not None else AMMO_NONE
+        ammo_reserve = int(reserve) if reserve is not None else AMMO_NONE
+
+        return {
+            "alive": alive,
+            "round_phase": phase,
+            "health": health,
+            "active_weapon": weapon,
+            "ammo_clip": ammo_clip,
+            "ammo_reserve": ammo_reserve,
+        }
 
     def read_frame_record(self):
         """One synchronized tick -> (frame, radar, record_dict).
@@ -150,11 +298,18 @@ class Recorder:
         Returns the FPV frame AND the high-res radar crop (D-024), both from the
         SAME grab via Capture.grab_with_radar, so the two feeds are inherently
         synchronized (same instant, one grab).
+
+        The GSI sample (D-031 alive/round_phase + D-033 state features) is taken
+        right after the grab — a single non-blocking slot read, so it adds no
+        measurable time to the loop and cannot stall it (the sync-critical
+        property). When use_gsi is off, the GSI fields are sentinels and are
+        simply not written by the FPV-only paths.
         """
         dx, dy = self.mouse.read_and_reset()
         keys = _read_keys()
         lclick, rclick = _read_clicks()
         frame, radar, t_cap = self.cap.grab_with_radar()
+        gsi = self._sample_gsi()
         record = {
             "t": t_cap,          # capture timestamp (perf_counter) — the anchor
             "keys": keys,        # 0/1 over LOGGED_KEYS order
@@ -162,6 +317,14 @@ class Recorder:
             "rclick": rclick,
             "dx": dx,            # summed raw mouse dx since last frame
             "dy": dy,
+            # GSI gameplay filter (D-031)
+            "alive": gsi["alive"],              # own-POV alive; bool
+            "round_phase": gsi["round_phase"],  # coarse GSI round phase or sentinel
+            # GSI state features — model INPUTS, not labels (D-033, v5)
+            "health": gsi["health"],            # 0-100, sentinel HEALTH_NONE
+            "active_weapon": gsi["active_weapon"],  # weapon name or sentinel
+            "ammo_clip": gsi["ammo_clip"],      # int, sentinel AMMO_NONE
+            "ammo_reserve": gsi["ammo_reserve"],  # int, sentinel AMMO_NONE
         }
         return frame, radar, record
 
@@ -306,6 +469,11 @@ class ChunkedSessionWriter:
     written the same way as `frames`. Nothing about the threading/crash-safety
     changes — the radar is just another index-aligned per-frame array.
 
+    v4 (D-031): each chunk ALSO holds per-frame `alive` (uint8 0/1) and
+    `round_phase` (fixed-width string) arrays from the GSI sample, buffered and
+    written exactly like the others. Still just more index-aligned per-frame
+    arrays; threading/crash-safety are untouched.
+
     Sync-safety (important, re D-015): the writer thread touches ONLY finished,
     handed-off buffers. It never touches the capture, the timestamps, or the
     mouse listener. The frame/input alignment path stays fully synchronous and
@@ -349,7 +517,9 @@ class ChunkedSessionWriter:
     @staticmethod
     def _empty_buffer():
         return {"t": [], "keys": [], "lclick": [], "rclick": [], "dx": [], "dy": [],
-                "frames": [], "radar": []}
+                "frames": [], "radar": [], "alive": [], "round_phase": [],
+                # v5 (D-033) state features
+                "health": [], "active_weapon": [], "ammo_clip": [], "ammo_reserve": []}
 
     def add(self, frame, radar, record):
         """Buffer one tick; hand off a chunk when the buffer reaches chunk_frames."""
@@ -362,6 +532,12 @@ class ChunkedSessionWriter:
         b["rclick"].append(record["rclick"])
         b["dx"].append(record["dx"])
         b["dy"].append(record["dy"])
+        b["alive"].append(record["alive"])            # v4 (D-031)
+        b["round_phase"].append(record["round_phase"])  # v4 (D-031)
+        b["health"].append(record["health"])          # v5 (D-033)
+        b["active_weapon"].append(record["active_weapon"])  # v5 (D-033)
+        b["ammo_clip"].append(record["ammo_clip"])    # v5 (D-033)
+        b["ammo_reserve"].append(record["ammo_reserve"])  # v5 (D-033)
         if len(b["frames"]) >= self.chunk_frames:
             self.flush()
 
@@ -426,6 +602,16 @@ class ChunkedSessionWriter:
             "rclick": np.asarray(b["rclick"], dtype=np.uint8),
             "dx": np.asarray(b["dx"], dtype=np.int32),
             "dy": np.asarray(b["dy"], dtype=np.int32),
+            # v4 (D-031): GSI own-POV alive (0/1) + coarse round phase per frame.
+            "alive": np.asarray(b["alive"], dtype=np.uint8),
+            "round_phase": np.asarray(b["round_phase"], dtype=f"<U{ROUND_PHASE_MAXLEN}"),
+            # v5 (D-033): GSI STATE FEATURES (model inputs, not labels). health
+            # 0-100 (uint8); active_weapon fixed-width string; ammo int16 so the
+            # AMMO_NONE=-1 sentinel is representable (uint8 could not hold -1).
+            "health": np.asarray(b["health"], dtype=np.uint8),
+            "active_weapon": np.asarray(b["active_weapon"], dtype=f"<U{WEAPON_MAXLEN}"),
+            "ammo_clip": np.asarray(b["ammo_clip"], dtype=np.int16),
+            "ammo_reserve": np.asarray(b["ammo_reserve"], dtype=np.int16),
         }
         np.savez_compressed(tmp, **arrays)
         os.replace(tmp, final)
@@ -574,22 +760,41 @@ def record(seconds=60.0, name=None):
     return path
 
 
-def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
-    """Extended chunked recording (Issue #4, v3 with radar per D-024).
+# How long to wait for GSI's first POST before giving up and refusing to record
+# (D-031). Generous: if GSI is configured, CS2 POSTs within a second or two of
+# the endpoint being reachable, so a timeout this long almost always means a real
+# config problem (BOM, wrong cfg dir, CS2 not restarted, port blocked).
+GSI_FIRST_CONTACT_GRACE_S = 15.0
 
-    Writes a v3 session folder (DATA_FORMAT.md): each frame stores the 150x270
-    FPV AND the 128x128 high-res radar crop, both from one grab, index-aligned.
-    Chunks flushed every `chunk_frames` frames so memory stays bounded and a crash
-    loses at most one in-progress chunk. Runs until F8, until `seconds` elapses
-    (if given), or until interrupted — and in every case the buffered frames are
-    flushed and the manifest marked complete, so you never lose a clean session.
+
+def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES,
+                   require_gsi=True, gsi_grace=GSI_FIRST_CONTACT_GRACE_S):
+    """Extended chunked recording (Issue #4; v4 with radar + GSI alive per D-031).
+
+    Writes a v4 session folder (DATA_FORMAT.md): each frame stores the 150x270
+    FPV, the 128x128 high-res radar crop (both from one grab), AND the per-frame
+    GSI `alive` + `round_phase` fields, all index-aligned. Chunks flushed every
+    `chunk_frames` frames so memory stays bounded and a crash loses at most one
+    in-progress chunk. Runs until F8, until `seconds` elapses (if given), or until
+    interrupted — and in every case the buffered frames are flushed and the
+    manifest marked complete, so you never lose a clean session.
+
+    GSI LIVENESS GATE (D-031): recording does NOT start until GSI's first POST
+    arrives. `require_gsi=True` (the default) means if no POST arrives within
+    `gsi_grace` seconds, the recorder REFUSES to start and points at the setup
+    checklist — turning a silent zero-frame session (config not loaded) into a
+    loud early failure. Because we wait for first contact before the capture loop
+    begins, there are NO pre-GSI frames to drop: every recorded frame carries a
+    real GSI-derived alive value. `require_gsi=False` records anyway after the
+    grace (alive defaults to dead until GSI speaks) — an escape hatch, not the
+    normal path; a v4 file recorded that way just has leading dead frames.
 
     Disk safety: refuses to start below MIN_FREE_DISK_GB, and stops cleanly if
     free space crosses that floor mid-session, so an unattended run can't fill
     the drive.
 
     This is what #4 means by "usable for extended sessions without babysitting,"
-    now producing the two-feed data the radar gate (#7) needs.
+    now producing the alive-labelled two-feed data #21's filter needs.
     """
     os.makedirs(_REC_DIR, exist_ok=True)
     if name is None:
@@ -603,21 +808,61 @@ def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
         return None
 
     dur = f"{seconds:.0f}s" if seconds else "until F8"
-    print(f"Recording session '{name}' ({dur}), v{SCHEMA_VERSION} (FPV + radar). "
-          f"Press F8 to stop.")
+    print(f"Recording session '{name}' ({dur}), v{SCHEMA_VERSION} "
+          f"(FPV + radar + GSI alive). Press F8 to stop.")
     print(f"  chunks every {chunk_frames} frames (~{chunk_frames/LOOP_FPS:.0f}s), "
           f"{free:.1f} GB free, floor {MIN_FREE_DISK_GB:.0f} GB.")
     print("  Play normally. Keep CS2 focused and in-game.\n")
 
-    writer = ChunkedSessionWriter(session_dir, chunk_frames=chunk_frames)
     n = 0
     dropped = 0
     stop_reason = "F8"
     t_start = time.perf_counter()
     last_t = None
     last_disk_check = t_start
+    writer = None
     try:
-        with Recorder() as rec:
+        with Recorder(use_gsi=True) as rec:
+            # ── GSI liveness gate (D-031) ──
+            # Wait for the first GSI POST BEFORE we create the session folder or
+            # grab a single frame. If it never comes, refuse to record so we
+            # don't produce a silent zero-frame (or all-dead) session because the
+            # .cfg wasn't loaded. This also means there are no pre-contact frames
+            # to drop: the loop below only ever sees a live GSI.
+            print(f"  Waiting up to {gsi_grace:.0f}s for CS2's first GSI POST "
+                  f"(alive/gameplay signal)...")
+            got_gsi = rec.gsi.wait_for_first_update(timeout=gsi_grace)
+            if not got_gsi:
+                if require_gsi:
+                    print("\n  REFUSING TO START: no GSI data from CS2 within "
+                          f"{gsi_grace:.0f}s. Nothing was recorded.")
+                    print("  GSI is how the recorder knows you're alive vs dead/"
+                          "spectating (D-031). Check, in order:")
+                    print("    1. gamestate_integration_agenticcs2.cfg is in "
+                          "<Steam>/.../game/csgo/cfg/")
+                    print("    2. it was saved WITHOUT a UTF-8 BOM")
+                    print("    3. CS2 was fully restarted AFTER adding it")
+                    print("    4. CS2 is running and you're in a game/menu, port "
+                          "3000 not blocked")
+                    print("  Confirm in isolation with: python -m src.recorder "
+                          "--verify-gsi   (or python -m src.gsi_probe)")
+                    print("  To record WITHOUT the alive signal anyway (leading "
+                          "frames marked dead), pass require_gsi=False.")
+                    return None
+                print(f"\n  WARNING: no GSI within {gsi_grace:.0f}s but "
+                      f"require_gsi=False — recording anyway. Leading frames will "
+                      f"be marked dead until GSI speaks (if it ever does).")
+            else:
+                st, _age = rec.gsi.read_latest()
+                a = st.get("alive") if st else None
+                print(f"  GSI live (first POST received; alive={a}). Recording "
+                      f"now — all frames carry a real alive flag.\n")
+
+            # First contact confirmed (or explicitly waived): NOW create the
+            # session and start the capture loop.
+            writer = ChunkedSessionWriter(session_dir, chunk_frames=chunk_frames)
+            t_start = time.perf_counter()
+            last_disk_check = t_start
             while True:
                 loop_start = time.perf_counter()
                 if _key_down(VK_QUIT):
@@ -648,8 +893,15 @@ def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES):
     finally:
         # ALWAYS flush + finalize, whatever stopped us. This is the crash-safety
         # payoff: an interrupted session still closes cleanly with all buffered
-        # frames written and the manifest marked complete.
-        total = writer.close()
+        # frames written and the manifest marked complete. `writer` is None only
+        # if we aborted at the GSI liveness gate before creating the session —
+        # nothing to finalize in that case.
+        total = writer.close() if writer is not None else 0
+
+    if writer is None:
+        # Aborted at the GSI gate (require_gsi and no contact). The refusal
+        # message already printed; no session was created.
+        return None
 
     elapsed = time.perf_counter() - t_start
     print(f"\nStopped ({stop_reason}). Session '{name}':")
@@ -794,15 +1046,142 @@ def verify(seconds=12.0):
     return passed
 
 
+def verify_gsi(seconds=30.0):
+    """Confirm GSI reaches the RECORDER and the alive rule reads correctly (D-032).
+
+    The recorder's own equivalent of raw_mouse --selftest: before trusting an
+    alive-labelled recording, prove that (a) CS2's GSI POSTs reach THIS process
+    through the shared listener, and (b) the per-frame sample the recorder will
+    write tracks reality — alive when you're alive, dead when you die, and DEAD
+    (not alive) when you die and spectate a living teammate (the own-POV rule,
+    D-032: own-POV is player.steamid == provider.steamid).
+
+    Runs the listener exactly as record_session does and prints the sampled
+    (alive, round_phase) on every change, plus the update age so you can see the
+    forward-fill/cadence. It also watches the underlying state so it can tell you
+    whether the death/spectate path was ACTUALLY exercised — a run where you never
+    died proves the fix removed the false-dead bug but does NOT confirm the
+    spectating guard, and the verdict says so rather than implying a full pass.
+    Does NOT record anything. What to do while it runs: in a bot match with a
+    living teammate, take damage, DIE, and let the death-cam follow that teammate
+    — the readout must show DEAD across the spectate, not ALIVE. (Deathmatch
+    respawns too fast to ever spectate; use a casual/competitive bot game.)
+    """
+    print("GSI VERIFY (recorder path). Confirming CS2's alive/gameplay signal")
+    print("reaches the recorder and the own-POV alive rule reads correctly.")
+    print("Start CS2 with the .cfg in place. To exercise the FULL check you must")
+    print("DIE and then spectate a LIVING teammate (bot match, not deathmatch) —")
+    print("the readout must show DEAD across the spectate (not ALIVE).")
+    print("Ctrl-C or wait for the timeout to stop.\n")
+
+    last = {}
+    # What we actually observed, so the verdict can be honest about coverage.
+    saw_alive = False           # at least one own-POV alive frame
+    saw_dead_own = False        # died on our own POV (health hit 0)
+    saw_spectating = False      # a spectating frame appeared (foreign steamid)
+    spectate_alive_bug = False  # spectating frame that WRONGLY read alive=True
+
+    with Recorder(use_gsi=True) as rec:
+        print(f"  Waiting up to {GSI_FIRST_CONTACT_GRACE_S:.0f}s for first GSI "
+              f"POST...")
+        if not rec.gsi.wait_for_first_update(timeout=GSI_FIRST_CONTACT_GRACE_S):
+            print("\n  NO GSI DATA. CS2 sent nothing. Check (in order): .cfg in")
+            print("  <Steam>/.../game/csgo/cfg/, saved BOM-free, CS2 restarted")
+            print("  after adding it, CS2 running, port 3000 free. This is the")
+            print("  same gate record_session uses — fix it before recording.")
+            return False
+        print("  GSI live. Watching sampled (alive, round_phase) on change:\n")
+        t_start = time.perf_counter()
+        while time.perf_counter() - t_start < seconds:
+            loop_start = time.perf_counter()
+            if _key_down(VK_QUIT):
+                break
+            # Use the SAME per-frame sampler the recorder writes from...
+            gsi = rec._sample_gsi()
+            alive, phase = gsi["alive"], gsi["round_phase"]
+            # ...and also peek at the richer state for coverage/diagnostics.
+            state, age = rec.gsi.read_latest()
+            spectating = bool(state.get("spectating")) if state else False
+            health = state.get("health") if state else None
+            weapon = gsi["active_weapon"]
+            clip, reserve = gsi["ammo_clip"], gsi["ammo_reserve"]
+            if alive:
+                saw_alive = True
+            if spectating:
+                saw_spectating = True
+                if alive:
+                    # This must NEVER happen under the D-032 rule; flag loudly.
+                    spectate_alive_bug = True
+            if (not alive) and (not spectating) and health == 0:
+                saw_dead_own = True
+
+            # Include the state features in the change key so HP/ammo/weapon
+            # transitions actually print (D-033) — otherwise a health drift at
+            # constant alive/phase would be invisible in the readout.
+            key = (alive, phase, spectating, health, weapon, clip, reserve)
+            if key != last.get("k"):
+                last["k"] = key
+                rel = time.perf_counter() - t_start
+                age_s = f"{age*1000:.0f}ms" if age is not None else "n/a"
+                spec = "  SPECTATING" if spectating else ""
+                hp = "" if health is None else f"  hp={health}"
+                # Show weapon + ammo; hide ammo for no-ammo weapons (sentinel -1).
+                wp = f"  wpn={weapon}" if weapon else ""
+                am = f"  ammo={clip}/{reserve}" if clip is not None and clip >= 0 else ""
+                print(f"  [{rel:6.1f}s] alive={str(alive):5}  "
+                      f"round_phase={phase!r:12}  (GSI age {age_s}){hp}{wp}{am}{spec}")
+            _pace(loop_start, LOOP_FPS)
+
+    # ── Verdict, tailored to what was actually observed ──
+    print("\n" + "=" * 70)
+    print("GSI VERIFY RESULT")
+    if spectate_alive_bug:
+        print("  FAIL: a SPECTATING frame read alive=True. The own-POV guard is not")
+        print("  working — on this CS2, player.steamid during spectate is NOT being")
+        print("  distinguished from provider.steamid. Inspect a spectating payload")
+        print("  (run `python -m src.gsi_probe`, die+spectate, read the JSONL) and")
+        print("  fix the own_pov test in extract_state() in gsi_listener.py before")
+        print("  recording. Do NOT trust the gameplay filter until this passes.")
+        ok = False
+    elif saw_alive and saw_spectating:
+        print("  PASS: saw own-POV ALIVE frames AND spectating frames, and every")
+        print("  spectating frame read DEAD (the D-032 own-POV guard held). The")
+        print("  recorder's alive labelling is trustworthy — clear to record v4.")
+        ok = True
+    elif saw_alive and saw_dead_own and not saw_spectating:
+        print("  PARTIAL: alive and own-death (health→0) both read correctly, but NO")
+        print("  spectating frame was seen, so the spectating guard was not")
+        print("  exercised this run. Re-run in a bot match and let the death-cam")
+        print("  follow a LIVING teammate to confirm spectate reads DEAD.")
+        ok = True
+    elif saw_alive:
+        print("  PARTIAL: own-POV ALIVE read correctly (the earlier false-dead bug is")
+        print("  gone), but you never died in front of the check, so neither death")
+        print("  nor spectating was exercised. Re-run and DIE + spectate a living")
+        print("  teammate to complete the verification.")
+        ok = True
+    else:
+        print("  INCONCLUSIVE: no own-POV alive frame was observed. Were you in an")
+        print("  active round on your own POV? Re-run while alive and playing, then")
+        print("  die + spectate to exercise the full path.")
+        ok = False
+    print("=" * 70)
+    return ok
+
+
 def _build_parser():
     p = argparse.ArgumentParser(
         description="Synchronized frame+input recorder (Issue #3, M0 gate; "
-                    "v3 FPV+radar per D-024).")
+                    "v4 FPV+radar+GSI-alive per D-024/D-031).")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--verify", action="store_true",
                    help="scripted-motion alignment check — RUN THIS FIRST")
+    g.add_argument("--verify-gsi", action="store_true",
+                   help="confirm GSI reaches the recorder + the alive rule reads "
+                        "right (incl. spectating => dead)")
     g.add_argument("--record", action="store_true",
-                   help="record an extended chunked session to disk (v3 folder: FPV+radar)")
+                   help="record an extended chunked session to disk (v4 folder: "
+                        "FPV+radar+GSI alive)")
     g.add_argument("--record-single", action="store_true",
                    help="record one single-file .npz (LEGACY v1, FPV-only; round-trip check)")
     g.add_argument("--dryrun", action="store_true",
@@ -827,6 +1206,8 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     if args.verify:
         verify(seconds=args.seconds or 12.0)
+    elif args.verify_gsi:
+        verify_gsi(seconds=args.seconds or 30.0)
     elif args.record:
         record_session(seconds=args.seconds, name=args.name)
     elif args.record_single:

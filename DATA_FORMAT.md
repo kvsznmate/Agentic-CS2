@@ -1,9 +1,46 @@
 # DATA_FORMAT.md — Agentic-CS2 on-disk recording schema
 
-**Status: v3, revised 2026-08 (Issue #7 / D-024).** This is the authoritative
+**Status: v5, revised 2026-08 (D-033).** This is the authoritative
 schema for self-recorded session files. Every loader, trainer, and inspection
 tool reads this format; change it only by bumping `schema_version` and updating
 this file in the same commit (per the living-docs rule in CLAUDE.md).
+
+**v5 vs v4 (what changed and why):** v5 adds four per-frame GSI **state features**
+— own-player state the model can CONDITION ON, sampled from the same GSI stream
+as the v4 alive flag (D-033): **`health`** (uint8 0–100), **`active_weapon`**
+(fixed-width string, sentinel `""`), **`ammo_clip`** and **`ammo_reserve`**
+(int16, sentinel **`-1`** for weapons with no ammo concept like knife/C4, or
+unknown). These are **model INPUTS, not action labels**: they belong on the `X`
+(input) side alongside the frame, so a future combat sub-policy (#12) can learn
+e.g. "clip empty → the human reloads" or "low HP → plays back". They are NOT part
+of the action vector `Y` (which stays keys/clicks/mouse). The loader exposes them
+via `load_state_features()`, deliberately separate from `get_batch`'s action `Y`.
+**Sentinels are load-bearing:** health/ammo of `0` are REAL states (dead / empty
+clip), so "absent" must be a distinct value — hence `-1` for ammo and the
+disambiguation of health-0 via the `alive` flag. **No current model reads these**
+(the D-027 movement baseline is unchanged); v5 records them now because they are
+free from the GSI stream already sampled and can only be captured live. The FPV,
+radar, alive, and round_phase fields are unchanged from v4.
+
+**v4 vs v3 (what changed and why):** v4 adds two per-frame fields sampled from
+CS2 Game State Integration (GSI) at capture time (D-030/D-031): **`alive`** (uint8
+0/1 — the GSI own-POV alive flag: health>0 AND not spectating) and
+**`round_phase`** (fixed-width string — the coarse freezetime/live/over phase, or
+the sentinel `"?"` when GSI carried none). These let non-gameplay frames (dead,
+spectating a teammate, menu/warmup) be filtered out downstream with an
+engine-authoritative signal instead of the radar-variance heuristic alone (issue
+#21). The FPV `frames` and `radar` arrays are unchanged from v3. The GSI listener
+is sampled once per frame off the capture thread; the alive flag is
+forward-filled between GSI updates (GSI is throttled/event-driven and coarser
+than the frame rate), and the recorder does not begin a session until GSI's first
+POST, so every recorded frame carries a real alive value. See D-031 for the alive
+rule, the liveness gate, and the known staleness limitation.
+
+**Back-compat (v4):** v1/v2/v3 sessions remain valid and readable; they simply
+have no `alive`/`round_phase` arrays, so the loader's gameplay filter
+(`use_gameplay_filter=True`) does not apply to them (those frames are not
+filtered by it rather than dropped). All FPV and radar inputs still work on
+v1/v2/v3.
 
 **v3 vs v2 (what changed and why):** v2 stored only the 150x270 FPV frame per
 tick, and "the radar" was a sub-rectangle cropped from that downscaled frame.
@@ -14,7 +51,8 @@ to 128x128 (D-024). The FPV `frames` array is unchanged (still 150x270). Both
 feeds come from ONE screen grab (`Capture.grab_with_radar`), so they are
 inherently synchronized. Everything else about the v2 container — the chunked
 session folder, crash-safety, manifest — is unchanged; `radar` is just another
-index-aligned per-frame array.
+index-aligned per-frame array. (v4 then added `alive`/`round_phase` the same way
+— see the top of this file.)
 
 **Back-compat:** v1 (single `.npz`, FPV only) and v2 (chunked, FPV only) remain
 valid and readable. They simply have no `radar` array, so the loader's radar
@@ -29,11 +67,13 @@ byte-for-byte v1; only the container changed.
 
 Related decisions: **D-012** (FPV capture geometry: fullscreen 1920x1080,
 full-frame crop, 150x270 FPV input), **D-024** (two-resolution capture: separate
-high-res radar crop), **D-015** (action fields: keys/clicks + raw mouse deltas),
+high-res radar crop), **D-031** (per-frame GSI alive/round_phase + recorder
+integration), **D-015** (action fields: keys/clicks + raw mouse deltas),
 **D-016** (loop rate), **D-017** (v1 array schema), **D-018** (chunked sessions),
 **D-019** (threaded chunk writes), **D-021** (whole-session held-out split),
-**D-022** (crashed sessions excluded at discovery). This file is the schema those
-decisions produce.
+**D-022** (crashed sessions excluded at discovery), **D-026** (radar-variance
+keep-mask, the secondary hygiene layer). This file is the schema those decisions
+produce.
 
 ---
 
@@ -71,7 +111,7 @@ data/recordings/session_20260810_131408/
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 5,
   "session": "session_20260810_131408",
   "geom": "fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L10T10W260H260 -> 128x128 BGR",
   "loop_fps_target": 15,
@@ -147,17 +187,27 @@ Do not sort or filter one array without the others.
 | `rclick` | (N,) | uint8 | 0/1 right mouse button held this tick. |
 | `dx` | (N,) | int32 | Raw mouse movement (device units) accumulated over the interval **ending** at this frame. +x = physical right. (D-015: relative deltas, not absolute view angle.) |
 | `dy` | (N,) | int32 | Raw mouse movement, vertical. +y = physical down. |
+| `alive` | (N,) | uint8 | **v4 (D-031, rule corrected in D-032).** GSI own-POV alive flag: `1` iff at this frame CS2's `player` block was OUR OWN POV (`player.steamid == provider.steamid`) AND reported `health > 0`. So dead frames AND frames spectating a living teammate (foreign steamid) are `0`. Sampled once per frame from the GSI listener and forward-filled between GSI updates. Used by the loader's authoritative gameplay filter (issue #21). Absent in v1/v2/v3. |
+| `round_phase` | (N,) | str (`<U16`) | **v4 (D-031).** Coarse GSI round phase at this frame (`freezetime`/`live`/`over`), or the sentinel `"?"` when the GSI update carried no phase. Fixed-width (16). Note: only the coarse phase is available from live solo play — the exact round-time countdown is observer-only (D-030), a constraint on M5. Absent in v1/v2/v3. |
+| `health` | (N,) | uint8 | **v5 (D-033).** Own-player health 0–100 from GSI, forward-filled between updates. A model INPUT (state to condition on), not an action label. `0` means dead OR no-local-state; disambiguate via `alive` (False in both cases, but `alive` distinguishes them from live play). Absent in v1–v4. |
+| `active_weapon` | (N,) | str (`<U24`) | **v5 (D-033).** GSI active weapon name (e.g. `weapon_ak47`), or sentinel `""` when unknown/menu. Fixed-width (24). A model INPUT. Absent in v1–v4. |
+| `ammo_clip` | (N,) | int16 | **v5 (D-033).** Rounds in the active weapon's clip, or sentinel **`-1`** when the weapon has no ammo concept (knife/C4) or ammo is unknown. `0` is a REAL state (empty clip) and is preserved distinct from `-1`. A model INPUT. Absent in v1–v4. |
+| `ammo_reserve` | (N,) | int16 | **v5 (D-033).** Reserve/spare ammo for the active weapon as GSI reports it, sentinel **`-1`** as for `ammo_clip`. A model INPUT. Absent in v1–v4. |
 
 Both `frames` and `radar` are captured in the SAME `grab_with_radar()` call, so
 they share the tick's single `timestamps[i]` anchor — the two feeds cannot drift
-relative to each other.
+relative to each other. The `alive`/`round_phase` sample is taken on that same
+tick (a non-blocking read of the GSI listener's latest-value slot), so it is
+index-aligned to the frame like every other per-frame array. It reflects the most
+recent GSI state as of that frame, forward-filled since GSI updates arrive
+coarser than the frame interval (D-031).
 
 ### Metadata arrays (fixed-size, not length N)
 
 | Key | Shape | dtype | Meaning |
 |---|---|---|---|
 | `key_names` | (11,) | str (`<U…`) | The key label for each column of `keys`, in order: `w, a, s, d, space, ctrl, shift, 1, 2, 3, r`. Always read column meaning FROM THIS ARRAY, never assume the order. |
-| `schema_version` | () scalar | int | Format version. **3** for this document (chunked FPV + radar). A v2 chunk carries 2 (FPV only); a legacy standalone v1 file carries 1. A loader should check this and refuse/adapt on an unknown value. |
+| `schema_version` | () scalar | int | Format version. **5** for this document (chunked FPV + radar + GSI alive/round_phase + GSI state features health/weapon/ammo). v4 = through alive/round_phase (no state features); v3 = FPV + radar, no GSI; v2 = FPV only; v1 = legacy standalone file. A loader should check this and refuse/adapt on an unknown value. |
 | `geom` | (…) | str | Human-readable capture-geometry stamp, now including BOTH the FPV crop and the **radar source rectangle + output size**, e.g. `"fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L10T10W260H260 -> 128x128 BGR"`. Records the conditions the frames were captured under so a file is self-describing. |
 | `loop_fps_target` | () scalar | int | The loop's target FPS at record time (D-016: 15). The REAL rate is derivable from `timestamps`. |
 
