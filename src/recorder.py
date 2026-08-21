@@ -509,6 +509,8 @@ class ChunkedSessionWriter:
 
         # capacity-1 queue = Option A single-chunk backpressure
         self._q = queue.Queue(maxsize=1)
+        self.max_flush_block_s = 0.0     # worst flush() block seen (backpressure tell, D-034)
+        self.last_write_secs = []        # per-chunk (compress+write) seconds (D-034)
         self._thread = threading.Thread(target=self._writer_loop, name="chunk-writer",
                                         daemon=True)
         self._thread.start()
@@ -548,6 +550,16 @@ class ChunkedSessionWriter:
         immediately starts a fresh buffer so the capture loop keeps running while
         the worker writes. Blocks ONLY if the previous chunk is still being
         written (capacity-1 queue) — the Option A backpressure.
+
+        Backpressure instrumentation (D-034): we time how long the put() blocks.
+        If the writer has already drained the queue the put is instant; a
+        non-trivial block here is the SIGNATURE of the writer failing to keep up
+        (compress+write slower than the fill window), which would stall the
+        capture loop at the boundary. `max_flush_block_s` records the worst case
+        so record_session can report whether backpressure (vs OS write-back) is
+        the boundary-stall cause — the two have different fixes and D-019's
+        verified-good baseline (~80 ms boundaries) regressed, so we measure
+        instead of guess.
         """
         b = self._buf
         if len(b["frames"]) == 0:
@@ -559,8 +571,12 @@ class ChunkedSessionWriter:
         fname = f"chunk_{idx:05d}.npz"
         self._chunk_index += 1
         self._buf = self._empty_buffer()  # main thread moves on immediately
-        # Hand off (idx, fname, buffer). put() blocks if worker still busy.
+        # Hand off (idx, fname, buffer). put() blocks if worker still busy — time it.
+        t_block0 = time.perf_counter()
         self._q.put((idx, fname, b))
+        blocked = time.perf_counter() - t_block0
+        if blocked > self.max_flush_block_s:
+            self.max_flush_block_s = blocked
 
     def _writer_loop(self):
         """Background thread: drain the queue, write each chunk, update manifest."""
@@ -583,7 +599,16 @@ class ChunkedSessionWriter:
                 self._q.task_done()
 
     def _write_chunk(self, idx, fname, b):
-        """Compress + atomically write one chunk. Runs on the writer thread."""
+        """Compress + atomically write one chunk. Runs on the writer thread.
+
+        Timed (D-034): the elapsed compress+write seconds are appended to
+        last_write_secs so record_session can compare per-chunk write time
+        against the chunk fill window. If write time << fill window, the writer
+        keeps up and any boundary stall is NOT backpressure (points at OS
+        write-back instead); if it approaches the fill window, backpressure is
+        real and the fix is a smaller chunk or a deeper queue.
+        """
+        t_w0 = time.perf_counter()
         final = os.path.join(self.dir, fname)
         # Temp name ends in .npz on purpose: np.savez_compressed APPENDS ".npz"
         # to any path not already ending in it, so a ".tmp" target would become
@@ -615,6 +640,7 @@ class ChunkedSessionWriter:
         }
         np.savez_compressed(tmp, **arrays)
         os.replace(tmp, final)
+        self.last_write_secs.append(time.perf_counter() - t_w0)
 
     def _write_manifest(self, complete):
         manifest = {
@@ -909,6 +935,29 @@ def record_session(seconds=None, name=None, chunk_frames=CHUNK_FRAMES,
           f"{elapsed:.0f}s, mean {total/max(elapsed,1e-9):.1f} FPS, "
           f"{dropped} long-gap frames ({100*dropped/max(total,1):.1f}%).")
     print(f"  Folder: {session_dir}")
+    # Writer diagnostics (D-034): tell backpressure apart from OS write-back as the
+    # cause of any chunk-boundary stall, instead of guessing. D-019 verified ~80 ms
+    # boundaries on v2; if they regressed, these numbers say why.
+    if writer.last_write_secs:
+        ws = writer.last_write_secs
+        fill_window = chunk_frames / max(total / max(elapsed, 1e-9), 1e-9)
+        worst_w = max(ws)
+        mean_w = sum(ws) / len(ws)
+        print(f"  Writer: per-chunk compress+write mean {mean_w:.2f}s, worst "
+              f"{worst_w:.2f}s; chunk fill window ~{fill_window:.0f}s; "
+              f"worst flush block {writer.max_flush_block_s*1000:.0f} ms.")
+        if writer.max_flush_block_s > 0.25:
+            print("  => BACKPRESSURE: the capture loop waited on the writer at a "
+                  "boundary. Writer can't keep up — shrink CHUNK_FRAMES or deepen "
+                  "the queue. (This is the boundary stall.)")
+        elif worst_w > 0.5 * fill_window:
+            print("  => Writer is slow (approaching the fill window) but not yet "
+                  "blocking capture. Boundary stalls, if any, are likely OS "
+                  "write-back; watch this margin as chunks grow.")
+        else:
+            print("  => Writer keeps up comfortably (write time << fill window, no "
+                  "flush block). Any boundary gap is OS disk write-back flushing "
+                  "the chunk, NOT the writer — a smaller chunk would spread it out.")
     if stop_reason == "low disk":
         print("  NOTE: stopped because free disk fell below the floor — the "
               "session up to here is complete and safe.")

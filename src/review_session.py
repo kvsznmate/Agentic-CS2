@@ -8,9 +8,13 @@ questions that actually matter before trusting a session:
      blank-radar keep-mask (clean_session.py) actually catch them?
 
 This tool plays a session back: the FPV and the high-res radar shown together,
-a seekbar, play/pause, single-frame stepping, and a live readout of that frame's
-logged actions (keys/clicks/mouse dx,dy) so you can SEE input and image together —
-the same alignment the M0 gate proved (#3), now visible frame by frame.
+a seekbar, play/pause, single-frame stepping, a live readout of that frame's
+logged actions (keys/clicks/mouse dx,dy), AND the per-frame GSI state on v4/v5
+sessions (alive/dead, round phase, and on v5 the health/weapon/ammo state
+features) so you can SEE input, image, and game-state together — the same
+alignment the M0 gate proved (#3), now visible frame by frame. The GSI line is
+coloured green when alive and red when dead/spectating. Older formats (v1-v3)
+simply omit the GSI line.
 
 If a keep-mask exists for the session (from `python -m src.clean_session`), frames
 the mask marks as BLANK/junk are tinted red and labelled, so you can:
@@ -99,6 +103,67 @@ def _fmt_actions(arrays, i, key_names):
     return f"keys[{keys_s}]  click[{clicks}]  mouse(dx={dx:+d}, dy={dy:+d})"
 
 
+def _fmt_gsi(arrays, i):
+    """One-line GSI state readout for frame i, or None if this session has no GSI.
+
+    Degrades by format: v1-v3 have no GSI at all (returns None -> caller draws
+    nothing); v4 has `alive`/`round_phase` but no state features; v5 adds
+    `health`/`active_weapon`/`ammo_clip`/`ammo_reserve` (D-033). Each field is
+    guarded so a v4 session doesn't crash on the missing v5 arrays.
+
+    The alive flag is the own-POV rule (D-032): alive=1 means our own POV AND
+    health>0, so a frame spectating a living teammate reads alive=0. We surface
+    playing-vs-SPECTATING too when the array is present, since 'dead' and
+    'spectating' are different reasons a frame is non-gameplay and it helps to see
+    which. Ammo shows only for weapons that HAVE ammo (sentinel -1 -> knife/C4,
+    shown as '-').
+    """
+    if "alive" not in arrays:
+        return None  # v1/v2/v3: no GSI recorded
+
+    alive = int(arrays["alive"][i])
+    life = "ALIVE" if alive else "dead"
+    phase = ""
+    if "round_phase" in arrays:
+        rp = arrays["round_phase"][i]
+        rp = rp.decode() if isinstance(rp, bytes) else str(rp)
+        phase = f"  round[{rp}]"
+
+    # State features (v5). All-or-nothing group, but guard each anyway.
+    state_bits = ""
+    if "health" in arrays:
+        hp = int(arrays["health"][i])
+        state_bits += f"  hp={hp:3d}"
+    if "active_weapon" in arrays:
+        wp = arrays["active_weapon"][i]
+        wp = wp.decode() if isinstance(wp, bytes) else str(wp)
+        wp = wp if wp else "-"
+        state_bits += f"  wpn[{wp}]"
+    if "ammo_clip" in arrays and "ammo_reserve" in arrays:
+        clip = int(arrays["ammo_clip"][i])
+        reserve = int(arrays["ammo_reserve"][i])
+        ammo = f"{clip}/{reserve}" if clip >= 0 else "-"   # -1 sentinel = no ammo concept
+        state_bits += f"  ammo[{ammo}]"
+
+    return f"GSI: {life}{phase}{state_bits}"
+
+
+def _life_state(arrays, i):
+    """(label, colour BGR) for the frame's life state, or None if no GSI.
+
+    Keyed purely off the stored `alive` flag. Note the recorded format keeps a
+    BARE boolean (D-031): spectating a living teammate is already folded into
+    alive=0 by the D-032 rule, but on disk we cannot tell 'dead on own POV' from
+    'spectating' apart — both are alive=0. So the dead label says both, honestly,
+    rather than claiming a distinction the data doesn't carry.
+    """
+    if "alive" not in arrays:
+        return None
+    if int(arrays["alive"][i]):
+        return ("ALIVE", (120, 230, 120))
+    return ("dead / spectating", (80, 80, 255))
+
+
 def _compose(fpv, radar, has_radar):
     """Build the side-by-side composite canvas (FPV left, radar right).
 
@@ -121,7 +186,7 @@ def _compose(fpv, radar, has_radar):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
 
     pane_h = max(fbh, radar_big.shape[0])
-    header, footer, gap, margin = 34, 56, 24, 16
+    header, footer, gap, margin = 34, 80, 24, 16
     canvas_h = header + pane_h + footer
     canvas_w = margin + fbw + gap + radar_big.shape[1] + margin
     canvas = np.full((canvas_h, canvas_w, 3), _PANEL_BG, np.uint8)
@@ -220,16 +285,16 @@ def review(path, init_fps=15.0, use_mask=True):
             overlay[:] = (0, 0, 160)
             canvas = cv2.addWeighted(canvas, 0.75, overlay, 0.25, 0)
 
-        # Footer text: frame counter, actions, timing, mask state.
+        # Footer text: frame counter, actions, GSI state, timing, mask state.
         y0 = header + pane_h + 20
         status = f"frame {i+1}/{n}   rec {real_fps:4.1f} FPS   play {state['fps']:4.1f} FPS"
         if state["playing"]:
             status += "  [PLAYING]"
         cv2.putText(canvas, status, (margin, y0 - 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (170, 210, 170), 1, cv2.LINE_AA)
-        cv2.putText(canvas, _fmt_actions(arrays, i, key_names), (margin, y0 + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
-
+        # Glanceable life tag on the status row (green ALIVE / red dead), if GSI.
+        life = _life_state(arrays, i)
+        # Mask state stays on the status row, right side (where it began).
         if state["show_overlay"] and keep is not None:
             tag = "BLANK / dropped" if dropped else "gameplay / kept"
             col = (80, 80, 255) if dropped else (120, 230, 120)
@@ -238,6 +303,17 @@ def review(path, init_fps=15.0, use_mask=True):
                 vtxt = f"  var={float(variance[i]):.0f} (cut {thr:.0f})"
             cv2.putText(canvas, tag + vtxt, (margin + 360, y0 - 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+        cv2.putText(canvas, _fmt_actions(arrays, i, key_names), (margin, y0 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+        # GSI state line (v4/v5): alive, round phase, hp, weapon, ammo on its own
+        # full-width row so long weapon names / ammo don't collide with anything.
+        # Coloured green alive / red dead for glanceability. Absent on v1-v3,
+        # where _fmt_gsi returns None and we draw nothing.
+        gsi_line = _fmt_gsi(arrays, i)
+        if gsi_line is not None:
+            gcol = life[1] if life is not None else (210, 200, 140)
+            cv2.putText(canvas, gsi_line, (margin, y0 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, gcol, 1, cv2.LINE_AA)
 
         cv2.imshow(win, canvas)
         if cv2.getTrackbarPos("frame", win) != i:

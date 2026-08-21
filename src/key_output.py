@@ -18,10 +18,14 @@ moves in CS2 BEFORE trusting any policy wired to it.
 
 WHAT THIS IS AND ISN'T:
   * IS: press / release / hold-for-a-duration of the movement keys (W/A/S/D) plus
-    the handful the recorder logs, by scan code, via SendInput.
-  * ISN'T: mouse output (aim) — not needed for the movement demo and deliberately
-    out of scope here. ISN'T any anti-cheat evasion — this is plain SendInput,
-    used ONLY offline on a local bot server (D-007). Online use is forbidden.
+    the handful the recorder logs, by scan code, via SendInput. ALSO (D-036):
+    relative mouse motion via `mouse_move_relative`, for NAVIGATION yaw — the
+    movement feed's view-turning, NOT combat aim. Mouse output is a NEW actuator
+    and, per the D-029 lesson, is UNPROVEN until `--selftest-mouse` shows the CS2
+    view actually turns; do not wire a policy to it before that passes.
+  * ISN'T: combat aim (that is the separate detector-gated model, #10 -> #11, via
+    the arbiter). ISN'T any anti-cheat evasion — this is plain SendInput, used
+    ONLY offline on a local bot server (D-007). Online use is forbidden.
 
 SAFETY (D-007): simulated input can trip anti-cheat. This must only ever drive an
 offline/local server. This module can't enforce that by itself (it just presses
@@ -58,10 +62,20 @@ else:
 
 # INPUT type
 INPUT_KEYBOARD = 1
+INPUT_MOUSE = 0
 # KEYBDINPUT flags
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
+
+# MOUSEINPUT flags (D-036, Piece 2). MOUSEEVENTF_MOVE is a RELATIVE move by
+# (dx, dy) in mouse units — exactly the form the model predicts (per-frame device
+# deltas), and the same relative semantics raw_mouse.py CAPTURED. We deliberately
+# do NOT use MOUSEEVENTF_ABSOLUTE: the model learned relative motion, and CS2
+# consumes relative mouse input for view control. Whether Source 2 actually reads
+# SendInput-injected relative motion is UNPROVEN until --selftest-mouse confirms it
+# in-game (the D-029 discipline: injected input is the thing that fails silently).
+MOUSEEVENTF_MOVE = 0x0001
 
 # SET-1 make (press) scan codes, US QWERTY, by physical key. Release is the same
 # code with KEYEVENTF_KEYUP. These follow the physical position, which is what the
@@ -176,6 +190,48 @@ def _winerr_name(err):
         5: "ERROR_ACCESS_DENIED (UIPI / integrity level)",
         87: "ERROR_INVALID_PARAMETER (bad INPUT struct — a bug in our call)",
     }.get(err, f"unknown code {err}")
+
+
+def mouse_move_relative(dx, dy):
+    """Inject ONE relative mouse move of (dx, dy) mouse units via SendInput (D-036).
+
+    This is the mouse counterpart to _send_scan: the FIRST mouse output in the
+    project. It sends a MOUSEEVENTF_MOVE event with relative dx/dy — the same
+    relative-delta form the model predicts and that raw_mouse.py captured, so a
+    predicted (dx, dy) can be replayed as view motion. dx>0 is rightward, dy>0 is
+    downward (matching the raw-capture sign convention in DATA_FORMAT.md).
+
+    Values are rounded to int and clamped to a sane per-call range so a
+    mispredicted spike can't hurl the view across the map in one frame (a safety
+    bound, not a model assumption). Sending (0, 0) is a no-op and skipped.
+
+    UNPROVEN UNTIL VERIFIED (D-029 discipline): whether CS2 actually turns from
+    this injected motion must be confirmed with --selftest-mouse in-game before any
+    policy is wired to it. Like scan-code output, this can insert successfully at
+    the Win32 level yet be ignored by the game's raw-input path; the self-test is
+    what distinguishes 'works' from 'silently does nothing'.
+    """
+    idx = int(round(dx))
+    idy = int(round(dy))
+    # Per-call clamp: a single frame's view move shouldn't exceed this many mouse
+    # units. Generous enough for fast turns, bounded enough that a bad prediction
+    # can't fling the camera. Not a model claim — a physical safety rail.
+    LIMIT = 600
+    idx = max(-LIMIT, min(LIMIT, idx))
+    idy = max(-LIMIT, min(LIMIT, idy))
+    if idx == 0 and idy == 0:
+        return
+    mi = MOUSEINPUT(dx=idx, dy=idy, mouseData=0, dwFlags=MOUSEEVENTF_MOVE,
+                    time=0, dwExtraInfo=0)
+    inp = INPUT(type=INPUT_MOUSE, union=_INPUTunion(mi=mi))
+    ctypes.set_last_error(0)
+    n = user32.SendInput(1, ctypes.byref(inp), _INPUT_SIZE)
+    if n != 1:
+        err = ctypes.get_last_error()
+        raise OSError(
+            f"SendInput inserted {n}/1 mouse events for move ({idx},{idy}) "
+            f"(GetLastError={err}: {_winerr_name(err)}; sizeof(INPUT)={_INPUT_SIZE}). "
+            f"Blocked before reaching any window.")
 
 
 def _resolve(key):
@@ -338,6 +394,71 @@ def selftest(only_key=None):
     print("         Check: CS2 focused? terminal as Admin? US-QWERTY layout?")
 
 
+def selftest_mouse(seconds=None):
+    """Prove injected RELATIVE mouse motion turns the CS2 view (D-036, D-029 rule).
+
+    The mouse counterpart to selftest(). Mouse output (mouse_move_relative) is a
+    NEW, UNPROVEN actuator: SendInput can report success while the game ignores the
+    motion, exactly the silent-failure mode scan codes had. So before any policy
+    drives the mouse, this must show the VIEW ACTUALLY TURNS in-game.
+
+    It sweeps the view RIGHT in small steps, then LEFT back, then DOWN then UP, so
+    you can watch each axis. What to check, on a LOCAL server (D-007), CS2 focused,
+    standing still:
+      * RIGHT phase -> your view should pan smoothly to the right,
+      * LEFT phase  -> pan back to the left (roughly returning to start),
+      * DOWN/UP     -> the view pitches down then up.
+    If the view does NOT move but SendInput reports success, CS2 is ignoring
+    injected mouse motion (raw-input filtering / focus / integrity) — the mouse
+    path is NOT usable and the model must not be wired to it. If it moves the WRONG
+    way, the sign convention needs flipping in play_movement, not here (this sends
+    exactly what DATA_FORMAT.md defines: +dx right, +dy down).
+
+    Deliberately uses the SAME mouse_move_relative path the policy will use, so a
+    pass here means the policy's actuation is trustworthy.
+    """
+    step = 8               # mouse units per injected move (small = smooth)
+    n_steps = 40           # steps per phase
+    pause = 0.02           # seconds between steps (~smooth at ~50 Hz)
+    print("MOUSE OUTPUT SELF-TEST (relative SendInput, D-036).")
+    print("Focus CS2, stand still on a LOCAL server (D-007: offline only).")
+    print("WATCH YOUR VIEW: it should pan right, back left, then down, then up.")
+    print("This is the make-or-break check that injected mouse motion reaches CS2 —")
+    print("the mouse analogue of the scan-code test. Ctrl-C to abort.\n")
+    print("Starting in:", end=" ", flush=True)
+    for c in (3, 2, 1):
+        print(c, end=" ", flush=True)
+        time.sleep(1.0)
+    print("\n")
+
+    phases = [("RIGHT", step, 0), ("LEFT", -step, 0),
+              ("DOWN", 0, step), ("UP", 0, -step)]
+    try:
+        for label, sx, sy in phases:
+            print(f"  sweeping {label} ({n_steps} steps of ({sx},{sy}))...",
+                  flush=True)
+            for _ in range(n_steps):
+                mouse_move_relative(sx, sy)
+                time.sleep(pause)
+            time.sleep(0.3)
+    except OSError as e:
+        print(f"\n    SendInput FAILED for mouse move: {e}")
+        print("    -> injected mouse events are being blocked before reaching CS2.")
+        print("       Same triage as the key path: run the terminal as Admin to")
+        print("       match CS2's integrity level; if already admin, the block is")
+        print("       likely anti-cheat/raw-input filtering. Do NOT wire the look")
+        print("       head to the mouse until this passes.")
+        return
+    print("\nDone. Did your VIEW pan right, then back left, then down, then up?")
+    print("  YES -> injected relative mouse motion reaches CS2; the look head can")
+    print("         drive the view (wire it in play_movement.py behind the arm guard).")
+    print("  NO (view didn't move, no error) -> CS2 is ignoring injected mouse")
+    print("         motion (raw-input filtering / focus / integrity). The mouse path")
+    print("         is NOT usable as-is; do NOT drive the model's dx/dy to it.")
+    print("  WRONG DIRECTION -> the path works; the sign is handled where the model")
+    print("         output is applied, not in key_output.")
+
+
 def _build_parser():
     p = argparse.ArgumentParser(
         description="Simulated keyboard output via SendInput scan codes (D-029). "
@@ -345,6 +466,9 @@ def _build_parser():
     g = p.add_mutually_exclusive_group()
     g.add_argument("--selftest", action="store_true",
                    help="press W/A/S/D in turn with a countdown — watch your character move")
+    g.add_argument("--selftest-mouse", action="store_true",
+                   help="sweep the VIEW right/left/down/up via injected relative mouse "
+                        "motion — the D-036 mouse-output check; watch your view turn")
     g.add_argument("--probe-focus", action="store_true",
                    help="inject 'w' into the focused window (type into Notepad) — the "
                         "CS2-vs-system diagnostic when --selftest is blocked")
@@ -361,6 +485,8 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     if args.selftest:
         selftest(only_key=args.key)
+    elif args.selftest_mouse:
+        selftest_mouse()
     elif args.probe_focus:
         probe_focus(seconds=args.seconds if args.seconds != 1.0 else 1.5)
     elif args.tap:

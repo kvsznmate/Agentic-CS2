@@ -44,6 +44,22 @@ Usage (see model_lstm.py for the trainer that consumes this):
     for X, Y in train_seq.iter_batches(batch_size=32):
         # X: (B, T, H, W, 3) uint8 BGR ; Y: (B, len(target_keys)) float32 0/1
         ...
+
+LOOK TARGETS (navigation yaw — dx/dy, D-036). The movement model gained a second
+output branch predicting mouse motion (dx/dy) so the navigation feed can ROTATE
+the player, not only strafe (a WASD-only mover can only move along the axis it
+spawned facing). These are the SAME raw device deltas the recorder logs (per
+DATA_FORMAT.md: dx/dy in device units, +x right, +y down), served at each window's
+LAST frame to match the many-to-one label convention. They are exposed WITHOUT
+touching the existing (X, Y) button path:
+  * get_batch(...)            -> (X, Y_keys)                unchanged
+  * get_batch_with_look(...)  -> (X, Y_keys, Y_look)        additive
+  * look_balance()            -> per-axis mean/std/mean-abs  for the zero-motion
+                                 baseline the trainer reports look error against
+IMPORTANT (scope boundary, D-036): dx/dy here are NAVIGATION yaw for the movement
+feed. They are NOT combat aim. Aim is the separate detector-gated model (#10 ->
+#11) that the arbiter switches to when an enemy is on screen. Predicting dx/dy in
+THIS model does not touch that gate. See DECISIONS D-036.
 """
 
 import numpy as np
@@ -99,8 +115,14 @@ class SequenceDataset:
 
         # Resolve target-key column indices once, from the action layout. Requires
         # at least one session; action_layout reads key_names from the data.
+        # Also resolve the dx/dy columns for the look branch (D-036): the same
+        # assembled action vector carries dx/dy, so we read their columns by name
+        # here and slice them in get_batch_with_look / look_balance. Resolving
+        # from action_layout (not a hardcoded offset) keeps this correct if the
+        # vector layout ever changes, per DATA_FORMAT.md's "read columns by name".
         if self._ds.n_sessions == 0:
             self._target_cols = []
+            self._look_cols = []
         else:
             layout = dl.action_layout(self._ds._arrays(0))
             missing = [k for k in self.target_keys if k not in layout]
@@ -109,6 +131,12 @@ class SequenceDataset:
                     f"target_keys {missing} not in action layout {layout}. "
                     f"Movement keys are a subset of key_names.")
             self._target_cols = [layout.index(k) for k in self.target_keys]
+            missing_look = [k for k in ("dx", "dy") if k not in layout]
+            if missing_look:
+                raise ValueError(
+                    f"look targets {missing_look} not in action layout {layout}. "
+                    f"dx/dy must be present to train the navigation-look branch.")
+            self._look_cols = [layout.index("dx"), layout.index("dy")]
 
         # Build the window index: (session_i, np.array of T consecutive locals).
         # The inner dataset numbers frames 0..n-1 per session in its _index; we
@@ -198,6 +226,85 @@ class SequenceDataset:
         _Xlast, Ylast_full = self._ds.get_batch(last_global)  # (B, 15)
         Y = Ylast_full[:, self._target_cols].astype(np.float32)
         return X, Y
+
+    def get_batch_with_look(self, window_positions):
+        """Like get_batch, but ALSO return the look (dx/dy) targets (D-036).
+
+        X      : (B, T, h, w, 3) uint8 — input frames per window.
+        Y_keys : (B, n_targets) float32 — 0/1 held-state of target_keys at the
+                 window's LAST frame (identical to get_batch's Y).
+        Y_look : (B, 2) float32 — RAW dx, dy (device units) at the window's LAST
+                 frame. NOT standardized here: standardization stats are computed
+                 by the trainer from the TRAIN split only and applied there, so
+                 this loader stays a pure data source and never leaks held-out
+                 statistics into the train transform (D-021 discipline extended to
+                 the look targets). +x is physical right, +y down (DATA_FORMAT.md).
+
+        Frames and last-frame actions are fetched exactly as in get_batch (one
+        grouped inner call each), so the button path's behaviour is unchanged and
+        the look columns are just an additional slice of the SAME assembled
+        action vector — they cannot fall out of sync with Y_keys.
+        """
+        B = len(window_positions)
+        T = self.seq_len
+        if B == 0:
+            th, tw = self._ds._out_hw()
+            return (np.empty((0, T, th, tw, 3), np.uint8),
+                    np.empty((0, self.n_targets), np.float32),
+                    np.empty((0, 2), np.float32))
+
+        flat_global = []
+        last_global = []
+        for wp in window_positions:
+            si, locals_arr = self._windows[wp]
+            for li in locals_arr:
+                flat_global.append(self._global_index(si, li))
+            last_global.append(self._global_index(si, locals_arr[-1]))
+
+        Xflat, _Yflat = self._ds.get_batch(flat_global)
+        h, w = Xflat.shape[1], Xflat.shape[2]
+        X = Xflat.reshape(B, T, h, w, 3)
+
+        _Xlast, Ylast_full = self._ds.get_batch(last_global)  # (B, 15)
+        Y_keys = Ylast_full[:, self._target_cols].astype(np.float32)
+        Y_look = Ylast_full[:, self._look_cols].astype(np.float32)   # raw dx/dy
+        return X, Y_keys, Y_look
+
+    def look_balance(self):
+        """Per-axis dx/dy statistics over all windows' LAST frames (D-036).
+
+        Returns {"dx": {"mean", "std", "mean_abs"}, "dy": {...}, "n": N}, all in
+        RAW device units. Two uses in the trainer:
+          * mean/std are the STANDARDIZATION stats — but the trainer recomputes
+            these from the TRAIN split alone and reuses them for held-out (never
+            the other way), so calling this on the train dataset is how those
+            stats are obtained; calling it on held-out is only for reporting.
+          * mean_abs is the ZERO-MOTION BASELINE: predicting dx=dy=0 gives a mean
+            absolute error of exactly mean_abs, so the model's look MAE is honest
+            only when compared against it (the dx/dy analogue of the button
+            majority-class baseline). A model barely beating mean_abs has learned
+            almost nothing about turning.
+        Reads only the last frame of each window, batched to bound memory.
+        """
+        if len(self) == 0:
+            nan = float("nan")
+            return {"dx": {"mean": nan, "std": nan, "mean_abs": nan},
+                    "dy": {"mean": nan, "std": nan, "mean_abs": nan}, "n": 0}
+        last_global = []
+        for si, locals_arr in self._windows:
+            last_global.append(self._global_index(si, locals_arr[-1]))
+        cols = []
+        for s in range(0, len(last_global), 8192):
+            gi = last_global[s:s + 8192]
+            _X, Yfull = self._ds.get_batch(gi)
+            cols.append(Yfull[:, self._look_cols].astype(np.float64))
+        allv = np.concatenate(cols, axis=0)   # (N, 2) raw dx/dy
+        out = {"n": int(allv.shape[0])}
+        for i, ax in enumerate(("dx", "dy")):
+            v = allv[:, i]
+            out[ax] = {"mean": float(v.mean()), "std": float(v.std()),
+                       "mean_abs": float(np.abs(v).mean())}
+        return out
 
     def iter_batches(self, batch_size=32, shuffle=True, seed=None, drop_last=False):
         """Yield (X, Y) batches over all windows.

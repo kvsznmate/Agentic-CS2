@@ -64,7 +64,7 @@ A behavioural-cloning FPS agent that splits perception into two feeds: a **radar
 - Panel structure encodes timing zones (position × round-time → likelihood).
 - Navigation controller queries it and returns a direction + hold-angle.
 **Benchmark:** query <1 ms; scripted scenarios give map-sensible directions.
-**Scope guard:** hand-authored heuristics only. Round-timing can't be learned from unstructured deathmatch-style self-play — don't try.
+**Scope guard:** hand-authored heuristics only. NOTE (D-035): the data is matchmaking, not deathmatch as this line once assumed — MM *does* have round timing, so "can't be learned" no longer holds as the reason. The panel stays hand-authored for now (small data, enemy positions are observer-only in GSI, keeps M5 simple), but this is reopenable — see D-005's correction and D-035.
 
 ### M6 — Integration & arbiter
 **Goal:** both feeds together, one actuator, clean handoff, real-time.

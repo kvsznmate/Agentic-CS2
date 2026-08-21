@@ -162,6 +162,43 @@ def load_alive_mask(session_path):
     return arrays["alive"].astype(bool)
 
 
+# Round phases that count as live playtime for the gameplay filter (D-035). We
+# drop ONLY 'freezetime' (frozen at spawn in MM — no real movement to learn) and
+# keep everything else, including the '?' sentinel (round.phase absent in that
+# GSI update): dropping unknowns would silently discard v4 frames where the phase
+# just wasn't captured, which is too aggressive. 'over' (post-round) is kept too
+# — players still move meaningfully after a round ends; it is not dead time the
+# way freezetime is.
+_FREEZETIME_PHASE = "freezetime"
+
+
+def load_not_freezetime_mask(session_path):
+    """Return a per-frame bool: True = keep (NOT freezetime), from the stored
+    `round_phase` array (v4, D-031), or None if the session has no `round_phase`
+    field (v1/v2/v3).
+
+    The freezetime half of the gameplay filter (D-035). In real matchmaking
+    freezetime is frozen-at-spawn dead time: the player cannot move, so those
+    frames are all-keys-released noise that would worsen the already-severe
+    movement class imbalance (D-027). This is the round-phase counterpart to
+    load_alive_mask; the two are ANDed in SessionDataset so 'gameplay' means
+    own-POV alive AND actually in live play. Only 'freezetime' is dropped; 'live',
+    'over', and the '?' sentinel are kept (see _FREEZETIME_PHASE note).
+
+    Length-N bool, index-aligned like every other per-frame array (guaranteed by
+    the load-time alignment assertion), so no staleness check is needed.
+    """
+    arrays = load_session_arrays(session_path)
+    if "round_phase" not in arrays:
+        return None
+    rp = arrays["round_phase"]
+    # round_phase is a fixed-width string array; compare as str to be dtype-safe
+    # (np '<Un' compares fine to a Python str, but bytes could sneak in on odd
+    # reads, so normalise).
+    rp_str = rp.astype(str)
+    return rp_str != _FREEZETIME_PHASE
+
+
 # State-feature columns (D-033, v5), in a fixed order. `active_weapon` is a string
 # and is returned separately from the numeric matrix (it can't share a float
 # array); the combat model (#12) will map weapon names to its own encoding.
@@ -526,8 +563,11 @@ class SessionDataset:
         # the index). Both default OFF: with neither filter, every frame is
         # indexed exactly as before, so the #7 gate and the committed split do not
         # move because a filter became available.
-        #   * use_gameplay_filter (D-031): keep frames where the stored GSI `alive`
-        #     flag is 1 (own-POV alive, not spectating). Authoritative; v4 only.
+        #   * use_gameplay_filter (D-031, D-035): keep frames where the stored
+        #     GSI `alive` flag is 1 (own-POV alive, not spectating) AND the stored
+        #     `round_phase` is not 'freezetime'. So it drops dead/spectating AND
+        #     frozen-at-spawn frames — i.e. keeps only live playtime. Authoritative;
+        #     v4+ only (needs the stored alive/round_phase arrays).
         #   * use_keep_mask (D-026): keep frames the radar-variance sidecar marks
         #     as non-blank. Heuristic; secondary hygiene.
         # When both are on, a frame must pass BOTH (logical AND) to be served -
@@ -540,6 +580,7 @@ class SessionDataset:
         self._kept_per_session = []  # served (post-mask) length per session
         n_masked_keep = 0           # excluded by the radar-variance keep-mask
         n_masked_alive = 0          # excluded by the GSI alive gameplay filter
+        n_masked_freeze = 0         # excluded by the freezetime filter (D-035)
         for si, path in enumerate(self.session_paths):
             n = self._session_length(path)
             self._session_lengths.append(n)
@@ -560,6 +601,24 @@ class SessionDataset:
                 # alive is None on v1/v2/v3 (no field): that session is simply not
                 # gameplay-filtered (can't be), rather than dropped wholesale.
 
+                # Freezetime half of the SAME filter (D-035): drop frozen-at-spawn
+                # frames so "gameplay" means own-POV alive AND in live play. ANDed
+                # with alive; counted separately (frames excluded by freezetime
+                # that were still alive) for an honest per-filter report. None on
+                # v1/v2/v3 (no round_phase) -> that half simply doesn't apply.
+                not_freeze = load_not_freezetime_mask(path)
+                if not_freeze is not None:
+                    if not_freeze.shape[0] != n:
+                        raise ValueError(
+                            f"{session_name(path)}: stored round_phase array "
+                            f"length {not_freeze.shape[0]} != session length {n} "
+                            f"- refusing to misalign the freezetime filter.")
+                    # count frames this drops that alive would have KEPT, so the
+                    # two numbers don't double-count the same excluded frame.
+                    still_alive = keep_combined  # after alive AND above
+                    n_masked_freeze += int((still_alive & ~not_freeze).sum())
+                    keep_combined &= not_freeze
+
             if use_keep_mask:
                 keep = load_keep_mask(path, expected_frames=n)
                 if keep is not None:
@@ -572,12 +631,15 @@ class SessionDataset:
 
         if use_gameplay_filter and n_masked_alive:
             print(f"  gameplay filter (GSI alive, D-031): excluded {n_masked_alive} "
-                  f"non-gameplay frame(s) across {len(self.session_paths)} "
+                  f"dead/spectating frame(s) across {len(self.session_paths)} "
                   f"session(s).")
+        if use_gameplay_filter and n_masked_freeze:
+            print(f"  gameplay filter (freezetime, D-035): excluded {n_masked_freeze} "
+                  f"additional freezetime frame(s).")
         if use_keep_mask and n_masked_keep:
             print(f"  keep-mask (radar variance, D-026): excluded {n_masked_keep} "
                   f"blank/no-radar frame(s).")
-        if (use_gameplay_filter or use_keep_mask) and (n_masked_alive or n_masked_keep):
+        if (use_gameplay_filter or use_keep_mask) and (n_masked_alive or n_masked_freeze or n_masked_keep):
             print(f"  serving {len(self._index)} frames after filtering.")
 
     @staticmethod
@@ -736,9 +798,10 @@ def build_datasets(rec_dir=_REC_DIR, crop="full", holdout_frac=DEFAULT_HOLDOUT_F
 
     Filtering (both default OFF, both applied identically to train and held-out
     so the split's meaning is unchanged):
-      * use_gameplay_filter (D-031): serve only frames whose stored GSI `alive`
-        flag is set — authoritative alive/gameplay filtering (issue #21). v4 only;
-        older sessions are unaffected.
+      * use_gameplay_filter (D-031, D-035): serve only live-playtime frames —
+        those whose stored GSI `alive` flag is set AND whose `round_phase` is not
+        'freezetime'. Authoritative alive + freezetime filtering (issue #21). v4+
+        only; older sessions are unaffected (no stored flags to filter on).
       * use_keep_mask (D-026): also exclude blank/no-radar frames per the
         variance sidecar. Combined with the above via AND (see SessionDataset).
 
@@ -770,8 +833,9 @@ def _summarise(argv=None):
                    help=f"held-out fraction for the hash split (default {DEFAULT_HOLDOUT_FRAC})")
     p.add_argument("--batch", type=int, default=8, help="sanity-check batch size")
     p.add_argument("--gameplay-filter", action="store_true",
-                   help="serve only GSI-alive gameplay frames (v4, D-031); reports "
-                        "how many frames each session keeps")
+                   help="serve only live-playtime frames: GSI-alive AND not "
+                        "freezetime (v4+, D-031/D-035); reports how many frames "
+                        "each filter half excludes")
     args = p.parse_args(argv)
 
     sessions = discover_sessions(report=True)
@@ -804,7 +868,7 @@ def _summarise(argv=None):
         train_ds, holdout_ds = build_datasets(
             crop=args.crop, holdout_frac=args.holdout_frac,
             use_gameplay_filter=args.gameplay_filter)
-        filt = " (GSI-alive gameplay only)" if args.gameplay_filter else ""
+        filt = " (live playtime: GSI-alive, not freezetime)" if args.gameplay_filter else ""
         print(f"Input '{args.crop}'{filt}: train {len(train_ds)} frames across "
               f"{train_ds.n_sessions} session(s); held-out {len(holdout_ds)} frames "
               f"across {holdout_ds.n_sessions} session(s).")

@@ -49,6 +49,17 @@ _DUMP_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "ca
 # (D-024); it's included here so it is displayed AND alignment-checked when present.
 _PER_FRAME = ["frames", "radar", "timestamps", "keys", "lclick", "rclick", "dx", "dy"]
 
+# Optional per-frame GSI arrays: `alive`/`round_phase` (v4, D-031) and the state
+# features `health`/`active_weapon`/`ammo_clip`/`ammo_reserve` (v5, D-033). These
+# must ALSO be loaded+concatenated from a folder's chunks, or the v4/v5 summary
+# blocks below never see them. They are handled separately from _PER_FRAME so a
+# v1/v2/v3 session that lacks them doesn't fail the strict alignment check (their
+# length is still checked implicitly by the loader, which is authoritative). This
+# is the same omission that once hid the radar array (see the note above) — kept
+# as its own list so adding a future per-frame array is a one-line change here.
+_PER_FRAME_GSI = ["alive", "round_phase",
+                 "health", "active_weapon", "ammo_clip", "ammo_reserve"]
+
 # Fallback frame budget if a session somehow lacks loop_fps_target.
 _DEFAULT_LOOP_FPS = 15
 
@@ -124,7 +135,7 @@ def _load_target(target):
         chunk_names = manifest.get("chunks", [])
         if not chunk_names:
             raise ValueError(f"Session {target} has no chunks listed in manifest.")
-        per_frame_lists = {k: [] for k in _PER_FRAME}
+        per_frame_lists = {k: [] for k in (_PER_FRAME + _PER_FRAME_GSI)}
         meta_arrays = {}
         chunk_lengths = []
         total_size = os.path.getsize(manifest_path)
@@ -134,7 +145,7 @@ def _load_target(target):
             chunk = _load_npz(cpath)
             if "frames" in chunk:
                 chunk_lengths.append(int(chunk["frames"].shape[0]))
-            for k in _PER_FRAME:
+            for k in (_PER_FRAME + _PER_FRAME_GSI):
                 if k in chunk:
                     per_frame_lists[k].append(chunk[k])
             for k in ("key_names", "schema_version", "geom", "loop_fps_target"):
