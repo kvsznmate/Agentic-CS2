@@ -255,13 +255,22 @@ def _batched_arrays(seq_ds, batch_size, shuffle, seed=None):
     yield from seq_ds.iter_batches(batch_size=batch_size, shuffle=shuffle, seed=seed)
 
 
-def _evaluate_lift(model, seq_ds, batch_size, baseline_rates=None):
+def _evaluate_lift(model, seq_ds, batch_size, baseline_rates=None, eval_batch=8):
     """Per-key held-out accuracy, majority-class baseline, and lift.
 
     baseline_rates: dict key->held_fraction from the TRAIN set. The majority-class
     baseline accuracy for a key is max(rate, 1-rate) evaluated on THIS set's
     labels — the honest 'predict the more common state' reference. If not given,
     it is computed from this dataset itself.
+
+    eval_batch: how many WINDOWS to run through model() per forward pass. Kept
+    SMALL (default 8) and independent of the training batch because a window is T
+    frames, so a TimeDistributed conv sees eval_batch*T frames at once; on the
+    large FPV crop (150x270) a full training-size batch made that first-conv
+    activation ~0.6 GB in ONE tensor and OOM'd on the 3.4 GB GPU after training
+    had fragmented VRAM (the radar 128x128 run survived the same code). Small
+    fixed-size predict calls keep the peak activation bounded regardless of frame
+    size, which is what makes eval robust on this machine (D-027).
 
     Returns a dict per key: {"acc", "baseline", "lift", "held"} plus "n".
     """
@@ -282,12 +291,18 @@ def _evaluate_lift(model, seq_ds, batch_size, baseline_rates=None):
             keys_out_idx = list(model.output_names).index("move_keys")
     except (ValueError, AttributeError):
         keys_out_idx = 0
-    # Deterministic pass (no shuffle) so eval is stable.
+    # Deterministic pass (no shuffle) so eval is stable. Fetch in the loader's
+    # batch_size chunks, but run model() in eval_batch-sized micro-batches via
+    # __call__ (not .predict, which builds/retains a predict function and can add
+    # its own batching); training=False, and we slice so peak VRAM is bounded.
     for X, Y in seq_ds.iter_batches(batch_size=batch_size, shuffle=False):
-        p = model.predict(X, verbose=0)
-        # Grab the button head from a multi-output prediction; pass through a
-        # single-output prediction unchanged.
-        p_keys = p[keys_out_idx] if isinstance(p, (list, tuple)) else p
+        preds = []
+        for s in range(0, X.shape[0], eval_batch):
+            xb = X[s:s + eval_batch]
+            out = model(xb, training=False)
+            ob = out[keys_out_idx] if isinstance(out, (list, tuple)) else out
+            preds.append(np.asarray(ob))
+        p_keys = np.concatenate(preds, axis=0) if preds else np.zeros((0, len(keys)))
         pred = (p_keys >= 0.5).astype(np.float32)
         n_correct += (pred == Y).sum(axis=0)
         n_held += Y.sum(axis=0)
@@ -340,7 +355,8 @@ def _standardize(look_raw, mean, std):
     return (look_raw - mean) / std
 
 
-def _evaluate_look(model, seq_ds, batch_size, look_mean, look_std, baseline_abs):
+def _evaluate_look(model, seq_ds, batch_size, look_mean, look_std, baseline_abs,
+                   eval_batch=8):
     """Per-axis look MAE in RAW device units, vs the zero-motion baseline.
 
     The model emits STANDARDIZED dx/dy; we invert with (train) mean/std back to
@@ -349,6 +365,10 @@ def _evaluate_look(model, seq_ds, batch_size, look_mean, look_std, baseline_abs)
     set's raw dx/dy (predict-zero error). A model is only meaningful where its MAE
     is clearly below baseline_abs — the dx/dy analogue of beating the button
     majority-class baseline.
+
+    eval_batch: windows per forward pass, small and fixed for the same VRAM reason
+    as _evaluate_lift (large FPV frames * T make a full-batch conv activation OOM
+    on the 3.4 GB GPU post-training).
 
     Returns {"dx": {"mae", "baseline", "improve"}, "dy": {...}, "n"}. `improve` is
     baseline - mae (positive = better than predicting no motion).
@@ -367,11 +387,16 @@ def _evaluate_look(model, seq_ds, batch_size, look_mean, look_std, baseline_abs)
         look_out_idx = 1
     abs_err = np.zeros(2, dtype=np.float64)
     total = 0
+    # Micro-batched model() calls (not .predict) to bound peak VRAM — see
+    # _evaluate_lift's note on the FPV OOM.
     for Xb, _Yk, Yl_raw in _iter_look_batches(seq_ds, batch_size, shuffle=False):
-        pred_std = model.predict(Xb, verbose=0)
-        # two-output model returns [keys, look]; grab the look head by index.
-        pred_look_std = (pred_std[look_out_idx]
-                         if isinstance(pred_std, (list, tuple)) else pred_std)
+        preds = []
+        for s in range(0, Xb.shape[0], eval_batch):
+            out = model(Xb[s:s + eval_batch], training=False)
+            ob = out[look_out_idx] if isinstance(out, (list, tuple)) else out
+            preds.append(np.asarray(ob))
+        pred_look_std = (np.concatenate(preds, axis=0) if preds
+                         else np.zeros((0, 2), np.float32))
         pred_raw = pred_look_std * look_std + look_mean       # invert standardize
         abs_err += np.abs(pred_raw - Yl_raw).sum(axis=0)
         total += Yl_raw.shape[0]
