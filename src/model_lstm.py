@@ -439,7 +439,8 @@ def _iter_look_batches(seq_ds, batch_size, shuffle, seed=None):
         yield seq_ds.get_batch_with_look(wp)
 
 
-def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std):
+def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std,
+                         oversample=1, eventful_mask=None):
     """Wrap a SequenceDataset as a keras.utils.Sequence for model.fit (perf fix).
 
     WHY THIS EXISTS: the training loop originally called model.train_on_batch() in
@@ -459,23 +460,51 @@ def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std):
     Standardization of the look targets uses the TRAIN-split mean/std passed in
     (D-036), identical to the old loop. Shuffling is per-epoch via on_epoch_end,
     matching the old `seed=ep` reshuffle.
+
+    OVERSAMPLING (D-037-followup, the turn-imbalance fix): with oversample>1 and
+    an eventful_mask (per-window bool from SequenceDataset.eventful_mask), windows
+    flagged eventful (rare movement key held, or a real turn / large |dx|) are
+    REPEATED `oversample` times in the per-epoch index, so the model sees more
+    turning per epoch. This is a DATA-MIX change only:
+      * it does NOT touch the loss or the labels (no divergence-from-compile risk),
+      * it applies ONLY here (the train adapter) — EVAL still visits each window
+        once, unweighted, so reported lift/MAE stay honest and comparable,
+      * it cannot cross the D-021 split (repeats indices WITHIN this train dataset).
+    WHY (probe finding): on forward-heavy data the keys head suppressed A/S/D and
+    the dx head mean-collapsed — because turn windows are rare. Repeating them is
+    the lower-risk lever than reweighting the loss. CAVEAT: repetition cannot
+    create turn variety that isn't in the data; it raises exposure to the turns
+    that ARE there, and can overfit them — more turning DATA is the real fix. With
+    oversample=1 (default) this is the original behaviour exactly.
     """
     _import_tf()
     from tensorflow import keras
+
+    n = len(seq_ds)
+    # Build the BASE index (which window positions exist, with repeats). Eventful
+    # windows appear `oversample` times; everything else once. Shuffling happens
+    # per-epoch over this base list. If no mask or oversample<=1, it's arange(n).
+    if oversample and oversample > 1 and eventful_mask is not None and n > 0:
+        reps = np.ones(n, dtype=np.int64)
+        reps[np.asarray(eventful_mask, dtype=bool)] = int(oversample)
+        base_index = np.repeat(np.arange(n), reps)
+    else:
+        base_index = np.arange(n)
 
     class _SeqAdapter(keras.utils.Sequence):
         def __init__(self):
             self._ds = seq_ds
             self._bs = batch_size
-            self._n = len(seq_ds)
-            self._order = np.arange(self._n)
+            self._base = base_index
+            self._order = self._base.copy()
             self._epoch = 0
             self._rng = np.random.default_rng(0)
             self._rng.shuffle(self._order)
 
         def __len__(self):
-            # Include the final partial batch (the old loop iterated every window).
-            return (self._n + self._bs - 1) // self._bs
+            # Batches over the (possibly oversampled) index; final partial kept.
+            m = len(self._order)
+            return (m + self._bs - 1) // self._bs
 
         def __getitem__(self, i):
             wp = self._order[i * self._bs:(i + 1) * self._bs].tolist()
@@ -487,9 +516,10 @@ def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std):
             return X, Yk
 
         def on_epoch_end(self):
-            # Reshuffle each epoch (the old loop reseeded per epoch).
+            # Reshuffle the base index each epoch (reseeded, like the old loop).
             self._epoch += 1
             self._rng = np.random.default_rng(self._epoch)
+            self._order = self._base.copy()
             self._rng.shuffle(self._order)
 
     return _SeqAdapter()
@@ -497,7 +527,8 @@ def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std):
 
 def train(crop="full", seq_len=8, epochs=10, batch_size=32,
           use_keep_mask=False, holdout_frac=dl.DEFAULT_HOLDOUT_FRAC,
-          manual_holdout=None, save=True, predict_look=True, look_loss_weight=1.0):
+          manual_holdout=None, save=True, predict_look=True, look_loss_weight=1.0,
+          oversample=1):
     """Train the movement baseline and report honest held-out metrics.
 
     Steps: build leak-free sequence splits (D-021) with the chosen input feed;
@@ -588,11 +619,30 @@ def train(crop="full", seq_len=8, epochs=10, batch_size=32,
     # _make_keras_sequence). The old hand-rolled train_on_batch loop stalled into
     # disk-swap on this machine; fit uses Keras's cached compiled train function
     # and the SAME compiled loss/metrics, so numbers are unchanged, memory is not.
+    # Oversampling of 'eventful' (turn / rare-key) windows, off by default
+    # (D-037-followup). Computed on the TRAIN split only; EVAL is never oversampled
+    # so its lift/MAE stay honest. See _make_keras_sequence for the rationale and
+    # the caveat that this cannot invent turn variety absent from the data.
+    ev_mask = None
+    if oversample and oversample > 1:
+        ev_mask, ev_info = train_seq.eventful_mask()
+        base = ev_info["n"]
+        eff = base + (oversample - 1) * ev_info["eventful"]
+        print(f"\nOversampling eventful windows x{oversample} (D-037-followup): "
+              f"{ev_info['eventful']}/{base} windows flagged eventful "
+              f"({ev_info['rare_hit']} rare-key, {ev_info['dx_hit']} big-|dx| "
+              f"> {ev_info['dx_abs_thresh']:.0f}); effective train windows/epoch "
+              f"{base} -> {eff}. EVAL is NOT oversampled (honest lift/MAE).")
+        if ev_info["eventful"] == 0:
+            print("  (No eventful windows found — oversampling is a no-op. Is the "
+                  "data all forward-walking?)")
+
     steps = max(1, n_train // batch_size)
     print(f"\nTraining: {epochs} epochs x ~{steps} steps (batch {batch_size}) "
           f"on {frame_hw[0]}x{frame_hw[1]} frames...")
     train_gen = _make_keras_sequence(train_seq, batch_size, predict_look,
-                                     look_mean, look_std)
+                                     look_mean, look_std,
+                                     oversample=oversample, eventful_mask=ev_mask)
     t0 = time.perf_counter()
     # workers=1 / no multiprocessing: the SequenceDataset reads frames via a
     # shared handle that isn't fork-safe, and single-worker is what removed the
@@ -748,6 +798,13 @@ def _build_parser():
                    help="weight on the look (dx/dy MSE) loss relative to the "
                         "per-key BCE (default 1.0; raise/lower if one term "
                         "dominates training)")
+    p.add_argument("--oversample", type=int, default=1,
+                   help="repeat 'eventful' windows (rare movement key held, or a "
+                        "real turn / large |dx|) this many times per epoch, to "
+                        "counter the forward-walking bias that suppresses A/S/D and "
+                        "collapses dx (D-037-followup). 1 = off (default). Affects "
+                        "TRAIN only; eval stays honest. Caveat: cannot invent turns "
+                        "absent from the data — more turning DATA is the real fix.")
     return p
 
 
@@ -760,7 +817,7 @@ def main(argv=None):
         train(crop=args.crop, seq_len=args.seq_len, epochs=args.epochs,
               batch_size=args.batch, use_keep_mask=args.use_keep_mask,
               holdout_frac=args.holdout_frac, predict_look=args.predict_look,
-              look_loss_weight=args.look_loss_weight)
+              look_loss_weight=args.look_loss_weight, oversample=args.oversample)
     else:
         print("Choose --train or --summary. See `python -m src.model_lstm -h`.")
 

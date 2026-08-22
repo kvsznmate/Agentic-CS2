@@ -306,6 +306,53 @@ class SequenceDataset:
                        "mean_abs": float(np.abs(v).mean())}
         return out
 
+    def eventful_mask(self, rare_keys=("a", "s", "d", "space"), dx_abs_thresh=None):
+        """Per-window boolean: is this window 'eventful' (a turn / rare action)?
+
+        Returns (mask[N] bool, info dict). A window is eventful if, at its LAST
+        frame, EITHER any of `rare_keys` is held OR |dx| exceeds dx_abs_thresh.
+        These are the windows under-represented in forward-heavy data (D-036/keys
+        imbalance): rare movement keys (A/S/D/space) and real turns (large dx).
+        Used ONLY by the trainer to OVERSAMPLE such windows so the model sees more
+        of them per epoch — it does NOT change the labels, the loss, or eval.
+
+        rare_keys deliberately EXCLUDES w/shift (already frequent — oversampling
+        them would defeat the purpose). dx_abs_thresh defaults to this dataset's
+        dx std (a turn 'bigger than typical'); pass a number to override. Reads
+        only last-frame vectors, batched, like target_balance/look_balance.
+
+        NOTE: computed on THIS dataset only. The trainer calls it on the TRAIN
+        SequenceDataset; it cannot move a window across the D-021 split (each side
+        is a separate dataset over disjoint sessions).
+        """
+        n = len(self)
+        if n == 0:
+            return np.zeros(0, dtype=bool), {"n": 0, "eventful": 0}
+        # Resolve which target columns count as 'rare' (intersection with the
+        # dataset's target_keys, by name, so it's robust to key-set changes).
+        rare_idx = [i for i, k in enumerate(self.target_keys) if k in rare_keys]
+        last_global = [self._global_index(si, la[-1]) for si, la in self._windows]
+        rare_hit = np.zeros(n, dtype=bool)
+        dx_vals = np.zeros(n, dtype=np.float64)
+        pos = 0
+        for s in range(0, len(last_global), 8192):
+            gi = last_global[s:s + 8192]
+            _X, Yfull = self._ds.get_batch(gi)
+            b = len(gi)
+            if rare_idx:
+                keycols = Yfull[:, [self._target_cols[i] for i in rare_idx]]
+                rare_hit[pos:pos + b] = (keycols > 0.5).any(axis=1)
+            dx_vals[pos:pos + b] = Yfull[:, self._look_cols[0]]   # dx column
+            pos += b
+        if dx_abs_thresh is None:
+            dx_abs_thresh = float(np.std(dx_vals)) if n > 1 else 0.0
+        dx_hit = np.abs(dx_vals) > dx_abs_thresh
+        mask = rare_hit | dx_hit
+        info = {"n": n, "eventful": int(mask.sum()),
+                "rare_hit": int(rare_hit.sum()), "dx_hit": int(dx_hit.sum()),
+                "dx_abs_thresh": float(dx_abs_thresh)}
+        return mask, info
+
     def iter_batches(self, batch_size=32, shuffle=True, seed=None, drop_last=False):
         """Yield (X, Y) batches over all windows.
 
