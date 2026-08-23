@@ -45,6 +45,7 @@ Usage:
   python -m src.review_session --session NAME    # a specific session (folder or path)
   python -m src.review_session --fps 30          # initial playback rate
   python -m src.review_session --no-mask         # ignore any keep-mask overlay
+  python -m src.review_session --radar-only      # show ONLY the masked radar (no FPV)
 
 Performance: frames are decompressed per session and held in memory by
 SessionDataset (fine at current scale). Playback is paced in the display loop;
@@ -164,18 +165,20 @@ def _life_state(arrays, i):
     return ("dead / spectating", (80, 80, 255))
 
 
-def _compose(fpv, radar, has_radar):
-    """Build the side-by-side composite canvas (FPV left, radar right).
+def _compose(fpv, radar, has_radar, radar_only=False):
+    """Build the composite canvas: FPV left + radar right, or radar-only.
 
     Returns a BGR uint8 image. Leaves a header/footer margin for text drawn by
     the caller. FPV and radar are upscaled to their view sizes; radar pane shows a
     placeholder when the session has no radar (v1/v2).
+
+    radar_only=True draws ONLY the radar pane (the masked 128x128 radar, D-039),
+    for scrubbing the radar the same way as the FPV. On a v1/v2 session (no radar)
+    it still shows the 'no radar' placeholder so the tool degrades cleanly rather
+    than erroring.
     """
     import cv2
-    fh, fw = fpv.shape[:2]
-    fpv_big = cv2.resize(fpv, (fw * _FPV_SCALE, fh * _FPV_SCALE),
-                         interpolation=cv2.INTER_NEAREST)
-    fbh, fbw = fpv_big.shape[:2]
+    header, footer, gap, margin = 34, 80, 24, 16
 
     if has_radar and radar is not None:
         radar_big = cv2.resize(radar, (_RADAR_VIEW, _RADAR_VIEW),
@@ -185,8 +188,24 @@ def _compose(fpv, radar, has_radar):
         cv2.putText(radar_big, "no radar (v1/v2)", (30, _RADAR_VIEW // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
 
+    if radar_only:
+        rbh, rbw = radar_big.shape[:2]
+        # Footer needs to fit the action + GSI lines; keep a comfortable min width.
+        canvas_w = max(margin + rbw + margin, 520)
+        canvas_h = header + rbh + footer
+        canvas = np.full((canvas_h, canvas_w, 3), _PANEL_BG, np.uint8)
+        rx = margin
+        canvas[header:header + rbh, rx:rx + rbw] = radar_big
+        cv2.putText(canvas, "radar (128, 3x, masked)", (rx, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
+        return canvas, (header, rbh, footer, margin)
+
+    fh, fw = fpv.shape[:2]
+    fpv_big = cv2.resize(fpv, (fw * _FPV_SCALE, fh * _FPV_SCALE),
+                         interpolation=cv2.INTER_NEAREST)
+    fbh, fbw = fpv_big.shape[:2]
+
     pane_h = max(fbh, radar_big.shape[0])
-    header, footer, gap, margin = 34, 80, 24, 16
     canvas_h = header + pane_h + footer
     canvas_w = margin + fbw + gap + radar_big.shape[1] + margin
     canvas = np.full((canvas_h, canvas_w, 3), _PANEL_BG, np.uint8)
@@ -218,7 +237,7 @@ def _next_in_state(keep, start, target_state, forward=True):
     return start
 
 
-def review(path, init_fps=15.0, use_mask=True):
+def review(path, init_fps=15.0, use_mask=True, radar_only=False):
     try:
         import cv2
     except ImportError:
@@ -231,6 +250,10 @@ def review(path, init_fps=15.0, use_mask=True):
         print("Session has 0 frames.")
         return
     has_radar = "radar" in arrays
+    if radar_only and not has_radar:
+        print("  --radar-only was requested but this session has no radar "
+              "(v1/v2). The radar pane will show a placeholder; there is nothing "
+              "to scrub. Record a v3+ session for a real radar.")
     key_names = [s.decode() if isinstance(s, bytes) else str(s)
                  for s in arrays["key_names"]]
 
@@ -275,7 +298,8 @@ def review(path, init_fps=15.0, use_mask=True):
         i = state["i"]
         fpv = arrays["frames"][i]
         radar = arrays["radar"][i] if has_radar else None
-        canvas, (header, pane_h, footer, margin) = _compose(fpv, radar, has_radar)
+        canvas, (header, pane_h, footer, margin) = _compose(
+            fpv, radar, has_radar, radar_only=radar_only)
         ch = canvas.shape[0]
 
         # Red tint if this frame is mask-dropped (blank/junk).
@@ -401,13 +425,19 @@ def _build_parser():
                    help="initial playback FPS (default 15; adjust live with [ and ])")
     p.add_argument("--no-mask", action="store_true",
                    help="ignore any keep-mask; do not tint frames")
+    p.add_argument("--radar-only", action="store_true",
+                   help="show ONLY the masked radar pane (no FPV), scrubbed the "
+                        "same way — seekbar, stepping, and the GSI ammo/weapon/hp "
+                        "readout all still work. On v1/v2 sessions (no radar) it "
+                        "shows a placeholder.")
     return p
 
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
     target = _resolve_target(args.session)
-    review(target, init_fps=args.fps, use_mask=not args.no_mask)
+    review(target, init_fps=args.fps, use_mask=not args.no_mask,
+           radar_only=args.radar_only)
 
 
 if __name__ == "__main__":

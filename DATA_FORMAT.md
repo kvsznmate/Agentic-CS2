@@ -5,6 +5,31 @@ schema for self-recorded session files. Every loader, trainer, and inspection
 tool reads this format; change it only by bumping `schema_version` and updating
 this file in the same commit (per the living-docs rule in CLAUDE.md).
 
+**Circular radar mask (2026-08, D-039) — NOT a schema bump.** The stored `radar`
+array now has its CORNERS FORCED TO BLACK: a filled circle (in 128×128 space, centre
+~(67,67), radius 63) is kept and everything outside it is zeroed, at capture time in
+`grab_with_radar`. Reason: the square radar crop unavoidably includes game SCENE in its
+corners (walls/floor outside the round minimap), and those pixels CHANGE as the player
+moves, so a model could learn from them as a spurious signal; masking makes the corners
+constant (black) so they carry no information. Like the D-038 re-crop, this changes only
+PIXEL VALUES, not the array's shape or dtype (still 128×128×3 uint8 BGR) and no reader
+behaves differently, so `schema_version` stays **5** — consistent with D-038's rule that a
+bump is for shape/dtype/contract changes, not pixel-content changes. The mask geometry is
+recorded in each file's `geom` (e.g. `... -> 128x128 BGR, circular mask c(67,67) r61`) and
+lives in `capture_config.RADAR_MASK_*`. It is applied at CAPTURE and baked in permanently;
+older v5 files (and all v1–v4) simply have unmasked radars — trust each file's `geom`.
+
+**Radar-rectangle change (2026-08, D-038) — NOT a schema bump.** The radar is now
+recorded CENTERED (see D-038), and the radar SOURCE rectangle was re-measured from
+`L10 T10 W260 H260` to **`L28 T32 W320 H320`** to fit the centered disc, which the old
+box clipped. This changes only the pixel region cropped and its `geom` stamp — the
+stored `radar` array is still 128×128 BGR, same shape and dtype — so `schema_version`
+stays **5** and no array contract changed. Consequence: v5 files recorded before and
+after this change carry DIFFERENT `geom` rectangles though both say v5. This is exactly
+why `geom` is stamped per file: always trust a file's own `geom`, never a constant.
+Sessions recorded with the old rectangle AND the non-centered radar must be re-recorded
+(they were confirmed disposable when this change was made).
+
 **v5 vs v4 (what changed and why):** v5 adds four per-frame GSI **state features**
 — own-player state the model can CONDITION ON, sampled from the same GSI stream
 as the v4 alive flag (D-033): **`health`** (uint8 0–100), **`active_weapon`**
@@ -113,7 +138,7 @@ data/recordings/session_20260810_131408/
 {
   "schema_version": 5,
   "session": "session_20260810_131408",
-  "geom": "fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L10T10W260H260 -> 128x128 BGR",
+  "geom": "fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L28T32W320H320 -> 128x128 BGR, circular mask c(67,67) r61",
   "loop_fps_target": 15,
   "chunks": ["chunk_00000.npz", "chunk_00001.npz"],
   "total_frames": 4833,
@@ -180,7 +205,7 @@ Do not sort or filter one array without the others.
 | Key | Shape | dtype | Meaning |
 |---|---|---|---|
 | `frames` | (N, 150, 270, 3) | uint8 | The FPV game image per tick. **BGR** (OpenCV-native, D-012). 150 high × 270 wide. The full downscaled screen; used for the detection/aim FPV models. |
-| `radar` | (N, 128, 128, 3) | uint8 | **v3 (D-024).** The CS2 minimap per tick, cropped from the FULL-resolution grab (source rectangle in `geom`) BEFORE the FPV downscale, resized to 128×128. **BGR.** Square, undistorted (square source → square target). Used for the navigation/radar gate (#7). NOT a crop of `frames`; a separate higher-res image. Absent in v1/v2. |
+| `radar` | (N, 128, 128, 3) | uint8 | **v3 (D-024).** The CS2 minimap per tick, cropped from the FULL-resolution grab (source rectangle in `geom`) BEFORE the FPV downscale, resized to 128×128. **BGR.** Square, undistorted (square source → square target). **Corners masked to black (v5+, D-039):** a circular mask (centre ~(67,67), radius 61 in 128-space) zeroes the game-scene corners outside the round minimap, so only the disc carries signal; exact mask in `geom`. Used for the navigation/radar gate (#7). NOT a crop of `frames`; a separate higher-res image. Absent in v1/v2. |
 | `timestamps` | (N,) | float64 | `time.perf_counter()` taken immediately after each frame grab — the alignment anchor. Seconds, monotonic, arbitrary origin. |
 | `keys` | (N, 11) | uint8 | 0/1 held-state of the 11 logged keys per tick, in the fixed order given by `key_names`. |
 | `lclick` | (N,) | uint8 | 0/1 left mouse button held this tick. |
@@ -208,7 +233,7 @@ coarser than the frame interval (D-031).
 |---|---|---|---|
 | `key_names` | (11,) | str (`<U…`) | The key label for each column of `keys`, in order: `w, a, s, d, space, ctrl, shift, 1, 2, 3, r`. Always read column meaning FROM THIS ARRAY, never assume the order. |
 | `schema_version` | () scalar | int | Format version. **5** for this document (chunked FPV + radar + GSI alive/round_phase + GSI state features health/weapon/ammo). v4 = through alive/round_phase (no state features); v3 = FPV + radar, no GSI; v2 = FPV only; v1 = legacy standalone file. A loader should check this and refuse/adapt on an unknown value. |
-| `geom` | (…) | str | Human-readable capture-geometry stamp, now including BOTH the FPV crop and the **radar source rectangle + output size**, e.g. `"fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L10T10W260H260 -> 128x128 BGR"`. Records the conditions the frames were captured under so a file is self-describing. |
+| `geom` | (…) | str | Human-readable capture-geometry stamp, now including BOTH the FPV crop and the **radar source rectangle + output size**, e.g. `"fullscreen 1920x1080 -> crop L0T0W1920H1080 -> FPV 270x150 BGR; radar src L28T32W320H320 -> 128x128 BGR, circular mask c(67,67) r61"`. Records the conditions the frames were captured under so a file is self-describing. |
 | `loop_fps_target` | () scalar | int | The loop's target FPS at record time (D-016: 15). The REAL rate is derivable from `timestamps`. |
 
 ---
@@ -221,13 +246,16 @@ The `radar` array is not a crop of `frames`. It is produced at capture time
 1. one full-resolution grab of the monitor (1920×1080),
 2. crop the minimap source rectangle **`(RADAR_SRC_LEFT, RADAR_SRC_TOP,
    RADAR_SRC_WIDTH, RADAR_SRC_HEIGHT)`** from that full-res image
-   (currently `L=10, T=10, W=260, H=260`, a square tight on the minimap disc,
-   measured via `python -m src.capture --radar-calibrate`),
-3. resize that crop to **`RADAR_OUT_HW`** (currently 128×128) with `INTER_AREA`.
+   (currently `L=28, T=32, W=320, H=320`, a square tight on the CENTERED minimap
+   disc, measured via `python -m src.capture --radar-calibrate`; see D-038),
+3. resize that crop to **`RADAR_OUT_HW`** (currently 128×128) with `INTER_AREA`,
+4. (D-039) apply the circular mask `RADAR_MASK` — zero every pixel outside the disc
+   (centre `RADAR_MASK_CENTER` ~(67,67), radius `RADAR_MASK_RADIUS` 61) so the
+   game-scene corners are black. Baked into the stored array at capture.
 
 The exact rectangle and output size live in `src/capture_config.py` and are
 stamped into each file's `geom`. They are **machine-specific** (they depend on the
-CS2 radar HUD scale and the monitor), so a recording made on a different setup
+CS2 radar HUD scale, the centered-radar cvars, and the monitor), so a recording made on a different setup
 carries its own `geom`; always trust the file's `geom`, not a hardcoded constant,
 when interpreting old data. The square source → square target keeps the minimap
 undistorted, the same principle D-012 applies to the FPV.

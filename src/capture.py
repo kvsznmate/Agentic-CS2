@@ -82,6 +82,10 @@ class Capture:
         self._radar_h = cfg.RADAR_SRC_HEIGHT
         rh, rw = cfg.RADAR_OUT_HW
         self._radar_out_wh = (rw, rh)
+        # Circular radar mask (D-039): precomputed (H,W) bool, True = keep, or
+        # None if disabled. Applied to the resized radar so stored corners are
+        # black (kills the game-scene corner pixels as a spurious signal).
+        self._radar_mask = cfg.RADAR_MASK
 
         self._sct = mss()
         self._monitor = self._resolve_monitor()
@@ -137,7 +141,8 @@ class Capture:
         frame     : (H, W, 3) BGR uint8, the FPV at cfg.MODEL_INPUT_HW (150x270).
         radar     : (rh, rw, 3) BGR uint8, the radar crop at cfg.RADAR_OUT_HW
                     (128x128), carved from the FULL-RES grab BEFORE the FPV
-                    downscale, so the minimap keeps its resolution.
+                    downscale, so the minimap keeps its resolution. Its corners
+                    are masked to black (D-039) so only the round minimap remains.
         timestamp : float, perf_counter() taken right after the raw grab.
 
         Both outputs come from the SAME single mss grab, so they are inherently
@@ -161,6 +166,11 @@ class Capture:
         radar_src = img[rt:rt + rh, rl:rl + rw]
         radar = cv2.resize(radar_src, self._radar_out_wh,
                            interpolation=cv2.INTER_AREA)
+        # Circular mask (D-039): force the corners (game scene outside the round
+        # minimap) to black, in-place, so the stored radar has no variable corner
+        # pixels for a model to latch onto. No-op when the mask is disabled.
+        if self._radar_mask is not None:
+            radar[~self._radar_mask] = 0
         # FPV downscale (same as grab()).
         frame = cv2.resize(img, self._resize_wh, interpolation=cv2.INTER_LINEAR)
         return frame, radar, t
@@ -334,6 +344,12 @@ def radar_calibrate(upscale=4, grid=False, rect_override=None):
         cv2.imwrite(grid_path, gimg)
 
     resized = cv2.resize(src, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    # Apply the SAME circular mask the recorder bakes in (D-039), so radar_out.png
+    # shows exactly what gets STORED — corners black. This is what makes calibrate
+    # a real confirmation of the mask geometry before recording.
+    if cfg.RADAR_MASK is not None:
+        resized = resized.copy()
+        resized[~cfg.RADAR_MASK] = 0
     out_path = os.path.join(out, "radar_out.png")
     cv2.imwrite(out_path, resized)
 
@@ -346,7 +362,8 @@ def radar_calibrate(upscale=4, grid=False, rect_override=None):
     print(f"  {src_path}      (raw full-res radar crop: {W}x{H})")
     if grid_path:
         print(f"  {grid_path}  (same crop, with a labelled 20px grid — read bounds here)")
-    print(f"  {out_path}      (crop resized to storage size: {out_w}x{out_h})")
+    print(f"  {out_path}      (crop resized to storage size: {out_w}x{out_h}"
+          f"{'; circular mask applied, D-039' if cfg.RADAR_MASK is not None else ''})")
     print(f"  {big_path}  ({upscale}x nearest upscale of the above, to eyeball)")
     print()
     print("TIGHTEN THE BOX TO THE MINIMAP (drop the HUD surround):")

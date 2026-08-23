@@ -438,15 +438,19 @@ def profile(seconds=20.0):
 
 
 def _geom_string():
-    """Human-readable capture-geometry stamp for self-describing files (D-017/D-024)."""
+    """Human-readable capture-geometry stamp for self-describing files (D-017/D-024/D-039)."""
     gw, gh = cfg.GAME_RES
     ih, iw = cfg.MODEL_INPUT_HW
     rh, rw = cfg.RADAR_OUT_HW
+    mask = ""
+    if getattr(cfg, "RADAR_MASK", None) is not None:
+        mcx, mcy = cfg.RADAR_MASK_CENTER
+        mask = f", circular mask c({mcx},{mcy}) r{cfg.RADAR_MASK_RADIUS}"
     return (f"fullscreen {gw}x{gh} -> crop "
             f"L{cfg.CROP_LEFT}T{cfg.CROP_TOP}W{cfg.CROP_WIDTH}H{cfg.CROP_HEIGHT} "
             f"-> FPV {iw}x{ih} {cfg.COLOR_FORMAT}; "
             f"radar src L{cfg.RADAR_SRC_LEFT}T{cfg.RADAR_SRC_TOP}"
-            f"W{cfg.RADAR_SRC_WIDTH}H{cfg.RADAR_SRC_HEIGHT} -> {rw}x{rh} {cfg.COLOR_FORMAT}")
+            f"W{cfg.RADAR_SRC_WIDTH}H{cfg.RADAR_SRC_HEIGHT} -> {rw}x{rh} {cfg.COLOR_FORMAT}{mask}")
 
 
 def _free_disk_gb(path):

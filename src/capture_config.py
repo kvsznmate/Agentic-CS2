@@ -88,29 +88,92 @@ COLOR_FORMAT = "BGR"
 # own need (planned DATA_FORMAT.md v2 -> v3). See #7 / DECISIONS (entry added
 # once the format lands).
 #
-# ── MEASURED (2026-08), still PENDING ONE CONFIRMATION PASS ──
-# --radar-calibrate confirmed the radar is LEGIBLE when cropped from full-res
-# (uploaded radar_out.png: minimap, geometry, dots all readable). The initial
-# generous 320x320@(0,0) box included the HUD surround (dark border + empty
-# strip below the map). Tightened by grid-reading radar_src_grid.png: the minimap
-# disc runs ~(10,10) to ~(270,270) in the crop's local coords. Because that crop
-# started at full-frame (0,0), local == source here, so the source rectangle is
-# left=10 top=10 width=260 height=260. SQUARE minimap -> RADAR_OUT_HW stays
-# square (128x128), so the resize carries no aspect distortion (same principle as
-# D-012 for the FPV).
+# ── MEASURED (2026-08) FOR THE CENTERED RADAR — D-038 ──
+# The radar is now recorded CENTERED (cl_radar_centered 1 + cl_radar_always_centered 1),
+# zoomed to a local player-relative window rather than the whole-map overview. In this
+# mode the self marker is fixed at the CENTRE of the disc, so self-position is known a
+# priori and the #7 probe no longer has to identify which marker is ours. This changed
+# the on-screen radar object, so the crop was re-measured (D-038), superseding the
+# overview-radar rectangle the old D-024 values were measured against.
 #
-# STILL TO DO before this is baked into the recorder/format: run one more
-#     python -m src.capture --radar-calibrate --grid
-# and confirm radar_src.png is tight on the minimap with no dead border (these
-# bounds were eyeballed off a 20px grid, so good to ~±10px). Only then wire it
-# into the recorder + DATA_FORMAT.md v3 — the rectangle is baked into every file
-# at CAPTURE time, so it must be right before recording resumes.
-RADAR_SRC_LEFT = 10     # px, within the 1920x1080 frame  (measured; confirm once)
-RADAR_SRC_TOP = 10      # px                               (measured; confirm once)
-RADAR_SRC_WIDTH = 260   # px  (10..270)                    (measured; confirm once)
-RADAR_SRC_HEIGHT = 260  # px  (10..270)                    (measured; confirm once)
+# HOW THESE NUMBERS WERE FOUND: on a centered full-res grab (radar_on_full.png), the
+# minimap disc was fit as a circle (Hough): centre (188,192), radius 156, i.e. the disc
+# spans x[32..344] y[36..348] (~312 px across). The old L10 T10 W260 H260 crop covered
+# only the upper-left of this disc and clipped the right side + bottom — exactly where the
+# map and the self marker sit. The rectangle below is that fitted disc plus a ~4px margin
+# per side, kept SQUARE so the resize to RADAR_OUT_HW carries no aspect distortion (the
+# D-012/D-024 principle). Verified by cropping: the whole disc sits inside with even
+# margin on all four edges; a little scene shows in the square's corners (unavoidable when
+# bounding a circle with a square — a circular mask could zero it later if wanted).
+#
+# CONFIDENCE / CAVEATS: measured from ONE grab via a Hough fit that was a touch generous,
+# so good to ~±4px; the margin absorbs that, so it will not clip. These bounds are
+# MACHINE- AND HUD-SPECIFIC: they depend on cl_hud_radar_scale and the centered-radar
+# cvars above. If any of those change, re-measure with `python -m src.capture
+# --radar-calibrate`. The rectangle is baked into every file at CAPTURE time (stamped into
+# each file's `geom`), so it must be right before recording resumes — the pre-D-038 dataset
+# was recorded with the old rectangle AND the non-centered radar and must be re-recorded.
+RADAR_SRC_LEFT = 28     # px, within the 1920x1080 frame  (centered radar, D-038)
+RADAR_SRC_TOP = 32      # px                               (centered radar, D-038)
+RADAR_SRC_WIDTH = 320   # px  (x 28..348)                  (centered radar, D-038)
+RADAR_SRC_HEIGHT = 320  # px  (y 32..352)                  (centered radar, D-038)
 
 # Size the radar crop is resized to for storage + the model (H, W). Square,
 # matching the square source region, so no aspect distortion. 128x128 is the
 # working choice for "enough to read position without bloating storage."
 RADAR_OUT_HW = (128, 128)  # (height, width)
+
+# ── CIRCULAR RADAR MASK (D-039) ───────────────────────────────────────────
+# The square radar crop necessarily includes GAME SCENE in its corners (the tan
+# walls/floor visible outside the round minimap). Those corner pixels CHANGE as
+# the player moves, so a model could learn from them as a spurious signal. This
+# mask forces the corners to black so only the round minimap remains, killing the
+# corners as a variable input. Applied at CAPTURE time in grab_with_radar(), so
+# the stored `radar` array already has black corners. NOT a schema bump (D-039):
+# the array stays 128x128x3 BGR, only pixel VALUES change — same rule as D-038.
+#
+# GEOMETRY: a filled circle in the RADAR_OUT_HW (128x128) output space. Centre and
+# radius were MEASURED from the centered-radar dump (radar_out_upscaled.png):
+# the disc sits at ~(67,67) with radius ~66 in 128-space. Radius was set to 63 from
+# that screenshot, then CORRECTED to 61 after checking a REAL stored radar_out.png:
+# at r=63 the CS2 radar's own yellow border RING (plus a sliver of scene just
+# outside it) survived along the bottom-right arc; r=61 cuts just inside that rim,
+# removing it while leaving all minimap content (walls, marker, FOV cone, labels)
+# intact. Tightening below 61 removes nothing further (the residual warm pixels are
+# the in-map yellow labels) and only risks clipping map. The centre is slightly off
+# (64,64) because the HUD disc itself is not perfectly centred in the crop.
+#
+# CONFIDENCE: centre/radius were first measured from a screenshot preview, then
+# CONFIRMED and corrected (63 -> 61) against a REAL stored radar_out.png from
+# --radar-calibrate. Still MACHINE/HUD-specific: they depend on cl_hud_radar_scale
+# and the centered-radar cvars. Because the mask is baked into every recorded file
+# permanently, RE-CONFIRM against a fresh grab if the HUD scale changes: run
+# `python -m src.capture --radar-calibrate` and check radar_out.png has black
+# corners/edges and no minimap clipped. If off, adjust the three constants below
+# and re-check — they are the single place the mask geometry lives.
+RADAR_MASK_ENABLED = True   # baked into stored radar at capture (D-039)
+RADAR_MASK_CENTER = (67, 67)  # (x, y) of disc centre in RADAR_OUT_HW space
+RADAR_MASK_RADIUS = 61        # px; pixels farther than this from centre -> black
+
+
+def _build_radar_mask():
+    """Precompute the (H,W) boolean radar mask once (True = keep, False = black).
+
+    Built at import from RADAR_MASK_CENTER/RADIUS in RADAR_OUT_HW space so
+    grab_with_radar() applies a cheap boolean index per frame rather than
+    recomputing the circle. Returns None when RADAR_MASK_ENABLED is False, so the
+    capture path can skip masking entirely (and older-style unmasked behaviour is
+    a one-flag change).
+    """
+    if not RADAR_MASK_ENABLED:
+        return None
+    import numpy as _np
+    h, w = RADAR_OUT_HW
+    cx, cy = RADAR_MASK_CENTER
+    yy, xx = _np.ogrid[:h, :w]
+    keep = (xx - cx) ** 2 + (yy - cy) ** 2 <= RADAR_MASK_RADIUS ** 2
+    return keep
+
+
+# Precomputed once; (H,W) bool with True inside the disc, or None if disabled.
+RADAR_MASK = _build_radar_mask()
