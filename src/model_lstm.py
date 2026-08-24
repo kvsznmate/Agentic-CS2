@@ -58,6 +58,7 @@ Usage:
   python -m src.model_lstm --train --crop centre       # centred FPV crop
   python -m src.model_lstm --train --crop radar        # the #7 radar->movement comparison
   python -m src.model_lstm --train --use-keep-mask      # exclude blank frames (D-026)
+  python -m src.model_lstm --train --gameplay-filter    # only live-playtime frames (GSI-alive, not freezetime; D-040)
   python -m src.model_lstm --train --look-loss-weight 0.5  # rebalance look vs button loss
   python -m src.model_lstm --train --epochs 15 --batch 32 --seq-len 8
   python -m src.model_lstm --summary                   # build + print model, no training
@@ -528,7 +529,7 @@ def _make_keras_sequence(seq_ds, batch_size, predict_look, look_mean, look_std,
 def train(crop="full", seq_len=8, epochs=10, batch_size=32,
           use_keep_mask=False, holdout_frac=dl.DEFAULT_HOLDOUT_FRAC,
           manual_holdout=None, save=True, predict_look=True, look_loss_weight=1.0,
-          oversample=1):
+          oversample=1, use_gameplay_filter=False):
     """Train the movement baseline and report honest held-out metrics.
 
     Steps: build leak-free sequence splits (D-021) with the chosen input feed;
@@ -549,18 +550,23 @@ def train(crop="full", seq_len=8, epochs=10, batch_size=32,
     SCOPE (D-036): dx/dy here are NAVIGATION yaw for the movement feed, NOT combat
     aim. Aim is the separate detector-gated model (#10 -> #11) the arbiter switches
     to on enemy contact; nothing here front-runs that gate.
+
+    use_gameplay_filter (D-040): when True, train only on live-playtime frames
+    (GSI-alive AND not-freezetime, D-031/D-035); windows never bridge a dropped-
+    frame gap. Default OFF, like use_keep_mask, so the #7 radar gate and the
+    committed baseline are not silently moved just by enabling a filter.
     """
     tf = _import_tf()
 
     frame_hw = (dl.RADAR_H, dl.RADAR_W) if crop == "radar" else _fpv_hw(crop)
     print(f"Building sequence datasets: crop='{crop}', seq_len={seq_len}, "
           f"targets={MOVEMENT_KEYS}, keep_mask={use_keep_mask}, "
-          f"predict_look={predict_look}.")
+          f"gameplay_filter={use_gameplay_filter}, predict_look={predict_look}.")
     try:
         train_seq, hold_seq = sl.build_sequence_datasets(
             crop=crop, seq_len=seq_len, target_keys=MOVEMENT_KEYS,
             holdout_frac=holdout_frac, manual_holdout=manual_holdout,
-            use_keep_mask=use_keep_mask)
+            use_keep_mask=use_keep_mask, use_gameplay_filter=use_gameplay_filter)
     except ValueError as e:
         # e.g. crop="radar" on v1/v2-only data (no radar array).
         raise SystemExit(
@@ -786,6 +792,12 @@ def _build_parser():
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--use-keep-mask", action="store_true",
                    help="exclude blank/no-radar frames via the D-026 keep-mask")
+    p.add_argument("--gameplay-filter", action="store_true",
+                   help="train only on live-playtime frames: GSI-alive AND not "
+                        "freezetime (v4+/v5, D-031/D-035/D-040). Default OFF, "
+                        "mirroring --use-keep-mask, so the #7 radar gate and the "
+                        "committed baseline don't move unless asked. Windows never "
+                        "bridge a dropped-frame (death/respawn/freezetime) gap.")
     p.add_argument("--holdout-frac", type=float, default=dl.DEFAULT_HOLDOUT_FRAC)
     # Look head (navigation yaw, D-036). ON by default: the movement feed needs
     # to rotate the player, not only strafe. --no-look reproduces the original
@@ -817,7 +829,8 @@ def main(argv=None):
         train(crop=args.crop, seq_len=args.seq_len, epochs=args.epochs,
               batch_size=args.batch, use_keep_mask=args.use_keep_mask,
               holdout_frac=args.holdout_frac, predict_look=args.predict_look,
-              look_loss_weight=args.look_loss_weight, oversample=args.oversample)
+              look_loss_weight=args.look_loss_weight, oversample=args.oversample,
+              use_gameplay_filter=args.gameplay_filter)
     else:
         print("Choose --train or --summary. See `python -m src.model_lstm -h`.")
 

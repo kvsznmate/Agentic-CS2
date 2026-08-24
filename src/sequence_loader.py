@@ -8,7 +8,8 @@ existing loader WITHOUT duplicating any of its logic — it reuses SessionDatase
 for decoding, cropping, the stored-radar path, action assembly, the whole-session
 split (D-021), and the optional keep-mask (D-026).
 
-TWO INVARIANTS THIS MUST NOT BREAK (both already enforced in data_loader):
+INVARIANTS THIS MUST NOT BREAK (split + keep-mask enforced in data_loader;
+gameplay filter added in D-040):
   1. WHOLE-SESSION SPLIT (D-021). A window must never span two sessions — frames
      from different sessions are not temporally continuous. Windows are built
      PER SESSION and never cross a session boundary.
@@ -18,6 +19,12 @@ TWO INVARIANTS THIS MUST NOT BREAK (both already enforced in data_loader):
      kept frames with no dropped frame in the middle. We do NOT stitch across a
      gap (that would put a pre-menu frame next to a post-menu frame and call them
      0.5 s apart). Runs shorter than T contribute no windows.
+  3. GAMEPLAY-FILTER CONTIGUITY (D-031/D-035/D-040). When use_gameplay_filter=True,
+     dead/spectating/freezetime frames are dropped the SAME way, feeding the SAME
+     run-level mask as the keep-mask — so a window never bridges a death/respawn
+     or freezetime gap either. Both filters combine (logical AND) and both are
+     applied at the RUN level here, never in the inner per-frame dataset (which
+     would renumber locals and hide the gaps).
 
 Concretely: for each session we take its kept local indices (all of them if no
 mask), split them into maximal runs of consecutive integers, and within each run
@@ -98,20 +105,24 @@ class SequenceDataset:
     """
 
     def __init__(self, session_paths, crop="full", seq_len=DEFAULT_SEQ_LEN,
-                 target_keys=DEFAULT_TARGET_KEYS, use_keep_mask=False):
+                 target_keys=DEFAULT_TARGET_KEYS, use_keep_mask=False,
+                 use_gameplay_filter=False):
         if seq_len < 1:
             raise ValueError(f"seq_len must be >= 1, got {seq_len}")
         self.seq_len = int(seq_len)
         self.target_keys = tuple(target_keys)
         self.crop = crop
-        # The underlying per-frame dataset. use_keep_mask here would EXCLUDE masked
-        # frames from ITS global index; we instead pass use_keep_mask=False to the
-        # inner dataset and do masking ourselves at the RUN level, because we need
-        # to know WHERE the gaps are to avoid bridging them. (Excluding frames in
-        # the inner index would renumber locals and hide the gaps.) So we read the
-        # mask directly per session below.
+        # The underlying per-frame dataset. Any frame-EXCLUDING filter (the D-026
+        # keep-mask OR the D-031/D-035 gameplay filter) would, if applied in the
+        # inner dataset, drop frames from ITS global index and thereby RENUMBER
+        # locals — hiding exactly the gaps a sequence must not stitch across. So
+        # the inner dataset is built UNFILTERED (both filters off) and we apply
+        # BOTH ourselves at the RUN level below, where we can see where the gaps
+        # are. That is why neither use_keep_mask nor use_gameplay_filter is passed
+        # to the inner SessionDataset.
         self._ds = dl.SessionDataset(session_paths, crop=crop, use_keep_mask=False)
         self._use_keep_mask = use_keep_mask
+        self._use_gameplay_filter = use_gameplay_filter
 
         # Resolve target-key column indices once, from the action layout. Requires
         # at least one session; action_layout reads key_names from the data.
@@ -151,14 +162,40 @@ class SequenceDataset:
 
         self._windows = []   # list of (session_i, locals_array[T])
         n_runs = n_short = 0
+        n_drop_alive = n_drop_freeze = n_drop_keep = 0
         for si, path in enumerate(self._ds.session_paths):
             n = self._ds._session_lengths[si]
+            # Per-session KEEP mask over the session's ORIGINAL frame indices; then
+            # windows are formed only from maximal runs of CONSECUTIVE kept frames
+            # (via _consecutive_runs), so a window never bridges a dropped-frame
+            # gap (the D-026 contiguity invariant — now honoured for the gameplay
+            # filter too). Both filters exclude frames the same way, so both feed
+            # this single mask and combine by logical AND.
+            keep_combined = np.ones(n, dtype=bool)
+            if self._use_gameplay_filter:
+                # Prime the inner cache once (the batches reuse it, so this adds no
+                # extra decompression) and read the v4/v5 GSI arrays from it. Drop
+                # a frame if it is dead/spectating (alive==0) OR frozen at spawn
+                # (round_phase=='freezetime') — i.e. keep only live playtime
+                # (D-031/D-035). Sessions lacking the fields (v1/v2/v3) are simply
+                # not gameplay-filtered, never dropped wholesale.
+                arrs = self._ds._arrays(si)
+                if "alive" in arrs:
+                    alive = arrs["alive"].astype(bool)
+                    n_drop_alive += int(n - int(alive.sum()))
+                    keep_combined &= alive
+                if "round_phase" in arrs:
+                    not_freeze = arrs["round_phase"].astype(str) != dl._FREEZETIME_PHASE
+                    # count only freezetime frames still kept after the alive step,
+                    # so the two numbers don't double-count the same excluded frame
+                    n_drop_freeze += int((keep_combined & ~not_freeze).sum())
+                    keep_combined &= not_freeze
             if self._use_keep_mask:
                 keep = dl.load_keep_mask(path, expected_frames=n)
-                locals_all = (np.nonzero(keep)[0] if keep is not None
-                              else np.arange(n))
-            else:
-                locals_all = np.arange(n)
+                if keep is not None:
+                    n_drop_keep += int((keep_combined & ~keep).sum())
+                    keep_combined &= keep
+            locals_all = np.nonzero(keep_combined)[0]
             for run in _consecutive_runs(locals_all):
                 n_runs += 1
                 if len(run) < self.seq_len:
@@ -167,7 +204,17 @@ class SequenceDataset:
                 # every length-T window within this contiguous run
                 for start in range(0, len(run) - self.seq_len + 1):
                     self._windows.append((si, run[start:start + self.seq_len]))
-        self._stats = {"runs": n_runs, "runs_too_short": n_short}
+        self._stats = {"runs": n_runs, "runs_too_short": n_short,
+                       "dropped_alive": n_drop_alive,
+                       "dropped_freezetime": n_drop_freeze,
+                       "dropped_keepmask": n_drop_keep}
+        if self._use_gameplay_filter and (n_drop_alive or n_drop_freeze):
+            print(f"  sequence gameplay filter (D-031/D-035): dropped "
+                  f"{n_drop_alive} dead/spectating + {n_drop_freeze} freezetime "
+                  f"frame(s) before windowing (live playtime only).")
+        if self._use_keep_mask and n_drop_keep:
+            print(f"  sequence keep-mask (D-026): dropped {n_drop_keep} "
+                  f"blank/no-radar frame(s) before windowing.")
 
     def __len__(self):
         return len(self._windows)
@@ -398,7 +445,8 @@ class SequenceDataset:
 def build_sequence_datasets(rec_dir=dl._REC_DIR, crop="full", seq_len=DEFAULT_SEQ_LEN,
                             target_keys=DEFAULT_TARGET_KEYS,
                             holdout_frac=dl.DEFAULT_HOLDOUT_FRAC,
-                            manual_holdout=None, use_keep_mask=False):
+                            manual_holdout=None, use_keep_mask=False,
+                            use_gameplay_filter=False):
     """Construct (train_seq, holdout_seq) with the leak-free whole-session split.
 
     Mirrors data_loader.build_datasets but yields SequenceDatasets. The split is
@@ -406,10 +454,20 @@ def build_sequence_datasets(rec_dir=dl._REC_DIR, crop="full", seq_len=DEFAULT_SE
     from disjoint session lists, so no window can straddle the boundary. crop
     selects the input feed: "full"/"centre"/(t,l,h,w) for the FPV baseline, or
     "radar" for the #7 radar-vs-movement comparison (same trainer, different feed).
+
+    use_gameplay_filter (D-040): when True, windows are built only from live-
+    playtime frames — GSI-alive AND not-freezetime (D-031/D-035) — with windows
+    never bridging a dropped-frame gap (handled at the run level inside
+    SequenceDataset). Default OFF, mirroring use_keep_mask, so the #7 radar gate
+    and the committed baseline don't move unless asked. Applied identically to
+    train and held-out so the split's meaning is unchanged. v4+/v5 only; older
+    sessions carry no alive/round_phase and are simply not filtered.
     """
     train_paths, holdout_paths = dl.split_sessions(rec_dir, holdout_frac, manual_holdout)
     train_seq = SequenceDataset(train_paths, crop=crop, seq_len=seq_len,
-                                target_keys=target_keys, use_keep_mask=use_keep_mask)
+                                target_keys=target_keys, use_keep_mask=use_keep_mask,
+                                use_gameplay_filter=use_gameplay_filter)
     holdout_seq = SequenceDataset(holdout_paths, crop=crop, seq_len=seq_len,
-                                  target_keys=target_keys, use_keep_mask=use_keep_mask)
+                                  target_keys=target_keys, use_keep_mask=use_keep_mask,
+                                  use_gameplay_filter=use_gameplay_filter)
     return train_seq, holdout_seq

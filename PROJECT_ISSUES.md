@@ -180,6 +180,8 @@ Get an AUTHORITATIVE "is the local player alive / is this real gameplay" signal 
 
 **Two hard limits GSI does NOT solve (recorded so they're not re-explored):** enemy/world positions are OBSERVER-only (`allplayers_position`), so GSI gives **nothing** for detection labels — #8 stays a separate FPV vision + labelling problem (see the note on #8). And round-*time* countdown (`phase_countdowns`) is observer-only too, so M5's panel gets only coarse `round.phase` from live play, not exact seconds.
 
+**Trainer wiring (2026-08, D-040):** the gameplay filter is now also threaded through the SEQUENCE trainer (`model_lstm --train --gameplay-filter` -> `sequence_loader`), which previously had NO way to exclude dead/spectating/freezetime frames — it trained on all frames regardless. Opt-in, **default OFF** (like `--use-keep-mask`), applied at the run level so windows never bridge a death/respawn/freezetime gap. py_compile-clean; effect not yet run on-machine. This extends part (3) from the loader to the models; it does not change #21's acceptance.
+
 **#21 does NOT close until the on-machine v4 verification passes** — the build is done (parts 1–3), but a real v4 session recorded and gameplay-filtered on-machine is the remaining bar, exactly as #2 passing was not M0 passing.
 
 ---

@@ -62,9 +62,9 @@ These files are the project's memory. Updating them is part of doing the work, n
 - Action labels are free from recording; **detection labels are a separate data problem.**
 - The radar does **not** show enemies — detection comes from the first-person image.
 - The probability panel is **hand-authored**, not learned.
-- CS2 is Source 2 — legacy D3D9 capture, RAM offsets, and GSI are dead/changed. Sync is the hard part, not capture.
+- CS2 is Source 2 — legacy D3D9 capture and RAM offsets are dead. GSI, once assumed dead too, is **alive on CS2** and is now our source for own-player state (alive / round-phase / health / weapon / ammo — D-030, D-033). Sync is the hard part, not capture.
 - One map end-to-end before generalizing.
-- Offline/local bot servers only — never online matchmaking.
+- **Agent runs offline/local against bots by default** (safety: injected input can trip VAC). Data is currently recorded in online MM, which is read-only and low-risk; running the *agent* online is an accepted-risk future option, NOT current practice — D-007/D-041.
 
 ---
 
